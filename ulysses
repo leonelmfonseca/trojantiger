@@ -1,1 +1,56 @@
 https://copilot.microsoft.com/shares/TzG7s7vbcw7n5xXjFCJE7
+
+public record MaskingNode(String fieldName, String maskPattern, boolean isDeep) {}
+
+public class MaskingRegistry {
+    private final Map<Class<?>, List<MaskingNode>> metadata = new ConcurrentHashMap<>();
+    private final String basePackage;
+
+    public MaskingRegistry(String basePackage) {
+        this.basePackage = basePackage;
+    }
+
+    public void scan() {
+        try (ScanResult scanResult = new ClassGraph()
+                .enableAllInfo()
+                .acceptPackages(basePackage)
+                .scan()) {
+            
+            scanResult.getAllClasses().forEach(classInfo -> {
+                List<MaskingNode> nodes = buildNodes(classInfo);
+                if (!nodes.isEmpty()) {
+                    metadata.put(classInfo.loadClass(), nodes);
+                }
+            });
+        }
+    }
+
+    private List<MaskingNode> buildNodes(ClassInfo classInfo) {
+        List<MaskingNode> nodes = new ArrayList<>();
+        // Handle both Record Components and Standard Fields
+        List<FieldInfo> allFields = new ArrayList<>(classInfo.getFieldInfo());
+        
+        for (FieldInfo field : allFields) {
+            AnnotationInfo annot = field.getAnnotationInfo(Sensitive.class.getName());
+            if (annot != null) {
+                String pattern = (String) annot.getParameterValues().get(0).getValue();
+                nodes.add(new MaskingNode(field.getName(), pattern, false));
+            } else if (isDrillable(field)) {
+                nodes.add(new MaskingNode(field.getName(), null, true));
+            }
+        }
+        return nodes;
+    }
+
+    private boolean isDrillable(FieldInfo field) {
+        TypeSignature type = field.getTypeSignatureOrTypeDescriptor();
+        if (type instanceof ClassRefTypeSignature classRef) {
+            return classRef.getBaseClassName().startsWith(basePackage);
+        }
+        return false;
+    }
+
+    public List<MaskingNode> getNodes(Class<?> clazz) {
+        return metadata.getOrDefault(clazz, Collections.emptyList());
+    }
+}
