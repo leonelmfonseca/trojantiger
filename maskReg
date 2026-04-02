@@ -1,65 +1,66 @@
-import io.github.classgraph.*;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import java.lang.reflect.*;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 
-public class MaskingRegistry {
-    private final String basePackage;
-    private final Map<Class<?>, List<MaskingNode>> registry = new ConcurrentHashMap<>();
-    private final Set<Class<?>> sensitiveClasses = Collections.newSetFromMap(new ConcurrentHashMap<>());
+@Service
+@RequiredArgsConstructor
+public class Shield {
+    private final MaskingRegistry registry;
 
-    public record MaskingNode(String fieldName, String maskPattern, boolean isDeep, Class<?> type) {}
-
-    public MaskingRegistry(String basePackage) {
-        this.basePackage = basePackage;
+    public <T> T mask(T original) {
+        return maskRecursive(original, new IdentityHashMap<>());
     }
 
-    public void scan() {
-        try (ScanResult scanResult = new ClassGraph()
-                .enableAllInfo()
-                .acceptPackages(basePackage)
-                .scan()) {
+    @SuppressWarnings("unchecked")
+    private <T> T maskRecursive(T source, Map<Object, Object> visited) {
+        if (source == null) return null;
+        if (visited.containsKey(source)) return (T) visited.get(source);
 
-            scanResult.getAllClasses().forEach(classInfo -> {
-                List<MaskingNode> nodes = buildPath(classInfo, new HashSet<>());
-                if (!nodes.isEmpty()) {
-                    Class<?> clazz = classInfo.loadClass();
-                    registry.put(clazz, nodes);
-                    sensitiveClasses.add(clazz);
-                }
-            });
+        Class<?> clazz = source.getClass();
+        if (!registry.isSensitive(clazz)) return source; // Fast Path
+
+        try {
+            T result = clazz.isRecord() ? maskRecord(source, visited) : maskPojo(source, visited);
+            visited.put(source, result);
+            return result;
+        } catch (Exception e) {
+            throw new RuntimeException("Shield failed to mask object of type: " + clazz.getName(), e);
         }
     }
 
-    private List<MaskingNode> buildPath(ClassInfo classInfo, Set<String> visited) {
-        if (classInfo == null || !visited.add(classInfo.getName())) return Collections.emptyList();
+    private <T> T maskRecord(T source, Map<Object, Object> visited) throws Exception {
+        Class<?> clazz = source.getClass();
+        RecordComponent[] components = clazz.getRecordComponents();
+        Object[] args = new Object[components.length];
+        Class<?>[] argTypes = new Class<?>[components.length];
 
-        List<MaskingNode> nodes = new ArrayList<>();
-        
-        // ClassGraph's getFieldInfo() picks up Record components too!
-        for (FieldInfo field : classInfo.getFieldInfo()) {
-            AnnotationInfo annot = field.getAnnotationInfo(Sensitive.class.getName());
-
-            if (annot != null) {
-                // Get the 'mask' value from the annotation
-                String pattern = (String) annot.getParameterValues().getValue("mask");
-                nodes.add(new MaskingNode(field.getName(), pattern, false, null));
-            } else {
-                // Check if we need to drill down (User-defined types in our package)
-                TypeSignature typeSig = field.getTypeSignatureOrTypeDescriptor();
-                if (typeSig instanceof ClassRefTypeSignature classRef) {
-                    ClassInfo typeInfo = classRef.getClassInfo();
-                    if (typeInfo != null && typeInfo.getName().startsWith(basePackage) && !typeInfo.isEnum()) {
-                        // Recurse: If children have sensitive data, mark this field as "isDeep"
-                        if (!buildPath(typeInfo, new HashSet<>(visited)).isEmpty()) {
-                            nodes.add(new MaskingNode(field.getName(), null, true, typeInfo.loadClass()));
-                        }
-                    }
-                }
-            }
+        for (int i = 0; i < components.length; i++) {
+            String name = components[i].getName();
+            Object val = components[i].getAccessor().invoke(source);
+            argTypes[i] = components[i].getType();
+            args[i] = processField(clazz, name, val, visited);
         }
-        return nodes;
+        return (T) clazz.getDeclaredConstructor(argTypes).newInstance(args);
     }
 
-    public boolean isSensitive(Class<?> clazz) { return sensitiveClasses.contains(clazz); }
-    public List<MaskingNode> getNodes(Class<?> clazz) { return registry.getOrDefault(clazz, List.of()); }
+    private <T> T maskPojo(T source, Map<Object, Object> visited) throws Exception {
+        Class<?> clazz = source.getClass();
+        T copy = (T) clazz.getDeclaredConstructor().newInstance();
+        for (Field field : clazz.getDeclaredFields()) {
+            if (Modifier.isStatic(field.getModifiers())) continue;
+            field.setAccessible(true);
+            Object val = field.get(source);
+            field.set(copy, processField(clazz, field.getName(), val, visited));
+        }
+        return copy;
+    }
+
+    private Object processField(Class<?> clazz, String fieldName, Object val, Map<Object, Object> visited) {
+        return registry.getNodes(clazz).stream()
+                .filter(node -> node.fieldName().equals(fieldName))
+                .findFirst()
+                .map(node -> node.isDeep() ? maskRecursive(val, visited) : node.maskPattern())
+                .orElse(val);
+    }
 }
