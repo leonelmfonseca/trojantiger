@@ -1,0 +1,109 @@
+o get to that "just annotate it and forget it" experience, we need to move the complexity into a Spring Boot Starter.
+
+By doing this, your library automatically hooks into the two main exit points of data: Jackson (Web/API) and Logback (Console/Files). Once the library is in the classpath, the developer doesn't need to call mask() manually—the infrastructure handles it.
+
+Here is the "Authority" implementation for a zero-touch security library.
+
+1. The "Zero-Touch" Jackson Integration
+
+This is the easiest part to make "automatic." By defining a Module bean in your auto-configuration, Spring Boot’s ObjectMapper will automatically pick it up and apply masking to every API response.
+
+Java
+// Inside your library's AutoConfiguration
+@Bean
+public Module sensitiveJacksonModule(MaskingRegistry registry) {
+    SimpleModule module = new SimpleModule();
+    module.setSerializerModifier(new BeanSerializerModifier() {
+        @Override
+        public List<BeanPropertyWriter> changeProperties(SerializationConfig config, 
+                BeanDescription beanDesc, List<BeanPropertyWriter> beanProperties) {
+            
+            for (BeanPropertyWriter writer : beanProperties) {
+                // If ClassGraph found this field is sensitive, swap the serializer
+                if (registry.isSensitive(beanDesc.getBeanClass(), writer.getName())) {
+                    writer.assignSerializer(new SensitiveJsonSerializer(registry));
+                }
+            }
+            return beanProperties;
+        }
+    });
+    return module;
+}
+2. The "Zero-Touch" Logging Integration
+
+Logging is trickier because log.info("{}", myRecord) calls myRecord.toString(). Since you can't easily change the bytecode of every class at runtime, the best way to handle this automatically is via a Logback Composite Converter.
+
+The developer adds %mask to their log pattern once in their logback-spring.xml, and from then on, every @Sensitive field is hidden.
+
+The Library Converter:
+
+Java
+public class AutoMaskingConverter extends MessageConverter {
+    @Override
+    public String convert(ILoggingEvent event) {
+        Object[] args = event.getArgumentArray();
+        if (args == null) return event.getFormattedMessage();
+
+        // Use our Shield utility to clone and mask the arguments automatically
+        Object[] maskedArgs = Arrays.stream(args)
+                .map(arg -> ShieldHolder.getShield().mask(arg))
+                .toArray();
+
+        return MessageFormatter.arrayFormat(event.getMessage(), maskedArgs).getMessage();
+    }
+}
+3. The "ClassGraph" Accelerator
+
+To make this performant enough for every log line, we use ClassGraph at startup to build a "BitSet" or a "FastMap" of sensitive classes. At runtime, we only perform the expensive deep-copy if ClassGraph told us the class actually contains a @Sensitive annotation.
+
+The "Is-it-Sensitive?" Check:
+
+Java
+public <T> T mask(T input) {
+    if (input == null) return null;
+    
+    // FAST PATH: ClassGraph told us this class has NO sensitive fields
+    if (!registry.containsSensitiveData(input.getClass())) {
+        return input; 
+    }
+
+    // SLOW PATH: Only clone and mask if necessary
+    return performDeepCopyAndMask(input);
+}
+4. Putting it all together: The Developer Experience
+
+Once you've packaged this library, the "Other Project" developer does exactly what you wanted:
+
+Step 1: Add Dependency
+
+XML
+<dependency>
+    <groupId>com.yourlib</groupId>
+    <artifactId>shield-spring-boot-starter</artifactId>
+    <version>1.0.0</version>
+</dependency>
+Step 2: Just Annotate
+
+Java
+public record UserRecord(
+    String name,
+    @Sensitive(mask = "XXX-XX-####") String ssn,
+    Address address // Drills down automatically
+) {}
+Step 3: Profit
+
+return userRecord; in a @RestController → Automatically Masked in JSON.
+
+log.info("Creating user: {}", userRecord); → Automatically Masked in Logs.
+
+Why this works:
+
+Jackson BeanSerializerModifier: Intercepts the serialization process. It sees the @Sensitive annotation on the field and decides to write the mask instead of the value.
+
+Logback MessageConverter: Intercepts the logging string. It checks if any of the objects being logged have been flagged by ClassGraph as "Sensitive" and replaces them with a masked clone.
+
+ClassGraph: Provides the "Intelligence." It maps out the entire project at startup so that at runtime, the library knows exactly where the landmines are without having to use slow reflection on every single request.
+
+Authority Tip: To make the logging truly "zero-touch" (without even changing the Logback XML), you can provide a LogbackConfigurator in your library that programmatically adds the converter to the logging context at startup.
+
+Are you comfortable with adding one line to the logback-spring.xml pattern, or should I show you the "Java Agent" approach to make it 100% invisible? (Warning: Java Agents are much more complex to maintain!)
