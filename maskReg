@@ -1,40 +1,26 @@
 import io.github.classgraph.*;
-import java.lang.reflect.RecordComponent;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class MaskingRegistry {
-
     private final String basePackage;
-    private final String annotationName;
-    
-    // Maps a Class to its list of sensitive instructions
     private final Map<Class<?>, List<MaskingNode>> registry = new ConcurrentHashMap<>();
-    
-    // Quick-lookup set to skip "clean" classes entirely at runtime
     private final Set<Class<?>> sensitiveClasses = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
-    public MaskingRegistry(String basePackage, Class<?> annotationClass) {
+    public record MaskingNode(String fieldName, String maskPattern, boolean isDeep, Class<?> type) {}
+
+    public MaskingRegistry(String basePackage) {
         this.basePackage = basePackage;
-        this.annotationName = annotationClass.getName();
     }
 
-    /**
-     * Performs a one-time classpath scan.
-     */
     public void scan() {
         try (ScanResult scanResult = new ClassGraph()
                 .enableAllInfo()
                 .acceptPackages(basePackage)
                 .scan()) {
 
-            // 1. Find all classes that have the annotation anywhere in their hierarchy
-            ClassInfoList classesWithSensitive = scanResult.getClassesWithAnnotation(annotationName);
-            
-            // 2. Also find classes that don't have the annotation but have "Drillable" fields 
-            // that eventually lead to a sensitive field.
             scanResult.getAllClasses().forEach(classInfo -> {
-                List<MaskingNode> nodes = buildPath(classInfo, scanResult, new HashSet<>());
+                List<MaskingNode> nodes = buildPath(classInfo, new HashSet<>());
                 if (!nodes.isEmpty()) {
                     Class<?> clazz = classInfo.loadClass();
                     registry.put(clazz, nodes);
@@ -44,34 +30,27 @@ public class MaskingRegistry {
         }
     }
 
-    private List<MaskingNode> buildPath(ClassInfo classInfo, ScanResult scanResult, Set<String> visited) {
-        if (classInfo == null || !visited.add(classInfo.getName())) {
-            return Collections.emptyList();
-        }
+    private List<MaskingNode> buildPath(ClassInfo classInfo, Set<String> visited) {
+        if (classInfo == null || !visited.add(classInfo.getName())) return Collections.emptyList();
 
         List<MaskingNode> nodes = new ArrayList<>();
-
-        // Handle Java 21 Records vs POJOs
-        List<? extends FieldInfo> fields = classInfo.isRecord() 
-            ? classInfo.getRecordComponentInfo() 
-            : classInfo.getFieldInfo();
-
-        for (FieldInfo field : fields) {
-            AnnotationInfo annot = field.getAnnotationInfo(annotationName);
+        
+        // ClassGraph's getFieldInfo() picks up Record components too!
+        for (FieldInfo field : classInfo.getFieldInfo()) {
+            AnnotationInfo annot = field.getAnnotationInfo(Sensitive.class.getName());
 
             if (annot != null) {
-                // TERMINAL NODE: Mask this specific field
+                // Get the 'mask' value from the annotation
                 String pattern = (String) annot.getParameterValues().getValue("mask");
                 nodes.add(new MaskingNode(field.getName(), pattern, false, null));
             } else {
-                // POTENTIAL DRILL NODE: Check if it's a user-defined type
+                // Check if we need to drill down (User-defined types in our package)
                 TypeSignature typeSig = field.getTypeSignatureOrTypeDescriptor();
                 if (typeSig instanceof ClassRefTypeSignature classRef) {
                     ClassInfo typeInfo = classRef.getClassInfo();
-                    
-                    if (typeInfo != null && isUserDefined(typeInfo)) {
-                        // RECURSIVE CHECK: Only drill if the nested class has sensitive data
-                        if (!buildPath(typeInfo, scanResult, new HashSet<>(visited)).isEmpty()) {
+                    if (typeInfo != null && typeInfo.getName().startsWith(basePackage) && !typeInfo.isEnum()) {
+                        // Recurse: If children have sensitive data, mark this field as "isDeep"
+                        if (!buildPath(typeInfo, new HashSet<>(visited)).isEmpty()) {
                             nodes.add(new MaskingNode(field.getName(), null, true, typeInfo.loadClass()));
                         }
                     }
@@ -81,21 +60,6 @@ public class MaskingRegistry {
         return nodes;
     }
 
-    /**
-     * Safety check: Only user-defined classes in the base package are scanned.
-     * Prevents scanning JDK, Spring, or Hibernate internals.
-     */
-    private boolean isUserDefined(ClassInfo info) {
-        return info.getName().startsWith(basePackage) && !info.isEnum();
-    }
-
-    // --- Runtime Accessors ---
-
-    public boolean hasSensitiveData(Class<?> clazz) {
-        return sensitiveClasses.contains(clazz);
-    }
-
-    public List<MaskingNode> getNodesForClass(Class<?> clazz) {
-        return registry.getOrDefault(clazz, Collections.emptyList());
-    }
+    public boolean isSensitive(Class<?> clazz) { return sensitiveClasses.contains(clazz); }
+    public List<MaskingNode> getNodes(Class<?> clazz) { return registry.getOrDefault(clazz, List.of()); }
 }
