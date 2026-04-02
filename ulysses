@@ -54,3 +54,82 @@ public class MaskingRegistry {
         return metadata.getOrDefault(clazz, Collections.emptyList());
     }
 }
+
+@Service
+@RequiredArgsConstructor
+public class Shield {
+    private final MaskingRegistry registry;
+
+    public <T> T mask(T original) {
+        return maskRecursive(original, new IdentityHashMap<>());
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T> T maskRecursive(T source, Map<Object, Object> visited) {
+        if (source == null) return null;
+        if (visited.containsKey(source)) return (T) visited.get(source);
+
+        Class<?> clazz = source.getClass();
+
+        // Handle Terminals (Strings, Primitives, Wrappers)
+        if (isTerminal(clazz)) return source;
+
+        // Handle Collections
+        if (source instanceof Collection<?> col) return (T) maskCollection(col, visited);
+        if (source instanceof Map<?, ?> map) return (T) maskMap(map, visited);
+
+        // Handle Records vs POJOs
+        try {
+            T result = clazz.isRecord() 
+                ? maskRecord((T) source, visited) 
+                : maskPojo((T) source, visited);
+            visited.put(source, result);
+            return result;
+        } catch (Exception e) {
+            throw new RuntimeException("Masking failed for " + clazz.getName(), e);
+        }
+    }
+
+    private <T> T maskRecord(T source, Map<Object, Object> visited) throws Exception {
+        Class<?> clazz = source.getClass();
+        RecordComponent[] components = clazz.getRecordComponents();
+        Object[] args = new Object[components.length];
+        Class<?>[] argTypes = Arrays.stream(components).map(RecordComponent::getType).toArray(Class[]::new);
+
+        for (int i = 0; i < components.length; i++) {
+            String name = components[i].getName();
+            Object val = components[i].getAccessor().invoke(source);
+            args[i] = processValue(clazz, name, val, visited);
+        }
+        return (T) clazz.getDeclaredConstructor(argTypes).newInstance(args);
+    }
+
+    private <T> T maskPojo(T source, Map<Object, Object> visited) throws Exception {
+        Class<?> clazz = source.getClass();
+        T copy = (T) clazz.getDeclaredConstructor().newInstance();
+        
+        for (Field field : clazz.getDeclaredFields()) {
+            if (Modifier.isStatic(field.getModifiers())) continue;
+            field.setAccessible(true);
+            Object val = field.get(source);
+            field.set(copy, processValue(clazz, field.getName(), val, visited));
+        }
+        return copy;
+    }
+
+    private Object processValue(Class<?> owner, String fieldName, Object val, Map<Object, Object> visited) {
+        return registry.getNodes(owner).stream()
+            .filter(n -> n.fieldName().equals(fieldName))
+            .findFirst()
+            .map(node -> node.isDeep() ? maskRecursive(val, visited) : node.maskPattern())
+            .orElseGet(() -> maskRecursive(val, visited));
+    }
+
+    private boolean isTerminal(Class<?> clazz) {
+        return clazz.isPrimitive() || Number.class.isAssignableFrom(clazz) || 
+               clazz == String.class || clazz == Boolean.class || clazz.isEnum();
+    }
+
+    // Helper methods for Collection/Map omitted for brevity—they just stream and call maskRecursive
+}
+
