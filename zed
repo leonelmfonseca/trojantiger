@@ -107,3 +107,6 @@ ClassGraph: Provides the "Intelligence." It maps out the entire project at start
 Authority Tip: To make the logging truly "zero-touch" (without even changing the Logback XML), you can provide a LogbackConfigurator in your library that programmatically adds the converter to the logging context at startup.
 
 Are you comfortable with adding one line to the logback-spring.xml pattern, or should I show you the "Java Agent" approach to make it 100% invisible? (Warning: Java Agents are much more complex to maintain!)
+
+
+@Around("@annotation(com.azqore.payments.sicipinconnector.aop.audit.annotation.Auditable) || " + "@within(com.azqore.payments.sicipinconnector.aop.audit.annotation.Auditable)")
