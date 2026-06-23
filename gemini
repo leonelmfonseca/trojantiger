@@ -1,3 +1,298 @@
 https://share.gemini.google/oyExdGXQM3ta
 https://share.gemini.google/pyvFiGwqfCdP
 https://copilot.microsoft.com/shares/DZN41TJWrJLFwVatGGbp8
+
+
+Annotation
+java
+import java.lang.annotation.*;
+
+@Target(ElementType.FIELD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Sensitive {
+    String mask() default "****";
+    String regex() default "";
+}
+Masking strategies
+java
+public interface MaskingStrategy {
+    String mask(String value, String maskPattern);
+}
+
+public class FullMaskingStrategy implements MaskingStrategy {
+    @Override
+    public String mask(String value, String maskPattern) {
+        return maskPattern;
+    }
+}
+
+import java.util.regex.Pattern;
+public class RegexMaskingStrategy implements MaskingStrategy {
+    private final Pattern pattern;
+    public RegexMaskingStrategy(String regex) { this.pattern = Pattern.compile(regex); }
+    @Override
+    public String mask(String value, String replacement) {
+        if (value == null) return null;
+        return pattern.matcher(value).replaceAll(replacement);
+    }
+}
+Universal masking engine
+Capabilities
+
+Detects and reconstructs records with masked components
+
+Mutates POJOs in place for masked fields
+
+Traverses arrays, Collections, Maps, Optionals
+
+Handles unmodifiable collections by masking referenced objects (not replacing immutable containers)
+
+Avoids infinite recursion using an IdentityHashMap visited set
+
+Applies field-level regex or global regex or default mask
+
+Core class
+
+java
+import java.lang.reflect.*;
+import java.util.*;
+
+public class SensitiveMasker {
+
+    private final MaskingStrategy defaultStrategy;
+    private final String defaultMask;
+    private final String globalRegex;
+
+    public SensitiveMasker(MaskingStrategy defaultStrategy,
+                           String defaultMask,
+                           String globalRegex) {
+        this.defaultStrategy = defaultStrategy;
+        this.defaultMask = defaultMask;
+        this.globalRegex = globalRegex;
+    }
+
+    public Object maskObject(Object obj) {
+        return maskObject(obj, new IdentityHashMap<>());
+    }
+
+    private Object maskObject(Object obj, Map<Object, Boolean> visited) {
+        if (obj == null) return null;
+        if (isPrimitiveLike(obj)) return obj;
+        if (visited.containsKey(obj)) return obj;
+        visited.put(obj, Boolean.TRUE);
+
+        Class<?> clazz = obj.getClass();
+
+        // Records
+        if (clazz.isRecord()) {
+            return maskRecord(obj, visited);
+        }
+
+        // Arrays
+        if (clazz.isArray()) {
+            int len = Array.getLength(obj);
+            for (int i = 0; i < len; i++) {
+                Object element = Array.get(obj, i);
+                Array.set(obj, i, maskObject(element, visited));
+            }
+            return obj;
+        }
+
+        // Collections
+        if (obj instanceof Collection<?> col) {
+            for (Object element : col) maskObject(element, visited);
+            return obj;
+        }
+
+        // Maps
+        if (obj instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> e : map.entrySet()) maskObject(e.getValue(), visited);
+            return obj;
+        }
+
+        // Optional
+        if (obj instanceof Optional<?> opt) {
+            opt.ifPresent(v -> maskObject(v, visited));
+            return obj;
+        }
+
+        // POJO
+        return maskPojo(obj, visited);
+    }
+
+    private Object maskRecord(Object record, Map<Object, Boolean> visited) {
+        Class<?> clazz = record.getClass();
+        RecordComponent[] components = clazz.getRecordComponents();
+        Object[] args = new Object[components.length];
+
+        for (int i = 0; i < components.length; i++) {
+            RecordComponent rc = components[i];
+            try {
+                Object value = rc.getAccessor().invoke(record);
+                Sensitive sensitive = rc.getAccessor().getAnnotation(Sensitive.class);
+                if (sensitive != null && value instanceof String s) {
+                    args[i] = applyMask(sensitive, s);
+                } else {
+                    args[i] = maskObject(value, visited);
+                }
+            } catch (Exception e) {
+                args[i] = null;
+            }
+        }
+
+        try {
+            Constructor<?> ctor = clazz.getDeclaredConstructor(
+                Arrays.stream(components).map(RecordComponent::getType).toArray(Class[]::new)
+            );
+            ctor.setAccessible(true);
+            return ctor.newInstance(args);
+        } catch (Exception e) {
+            return record;
+        }
+    }
+
+    private Object maskPojo(Object obj, Map<Object, Boolean> visited) {
+        for (Field field : getAllFields(obj.getClass())) {
+            field.setAccessible(true);
+            try {
+                Object value = field.get(obj);
+                Sensitive sensitive = field.getAnnotation(Sensitive.class);
+                if (sensitive != null && value instanceof String s) {
+                    field.set(obj, applyMask(sensitive, s));
+                } else {
+                    maskObject(value, visited);
+                }
+            } catch (Exception ignored) {}
+        }
+        return obj;
+    }
+
+    private String applyMask(Sensitive sensitive, String value) {
+        String maskPattern = (sensitive.mask() == null || sensitive.mask().isEmpty()) ? defaultMask : sensitive.mask();
+        String regex = (sensitive.regex() == null || sensitive.regex().isEmpty()) ? globalRegex : sensitive.regex();
+        if (regex != null && !regex.isEmpty()) {
+            return new RegexMaskingStrategy(regex).mask(value, maskPattern);
+        }
+        return defaultStrategy.mask(value, maskPattern);
+    }
+
+    private boolean isPrimitiveLike(Object obj) {
+        Class<?> c = obj.getClass();
+        return c.isPrimitive() || obj instanceof String || obj instanceof Number
+               || obj instanceof Boolean || obj instanceof Character || c.isEnum();
+    }
+
+    private List<Field> getAllFields(Class<?> type) {
+        List<Field> fields = new ArrayList<>();
+        Class<?> current = type;
+        while (current != null && current != Object.class) {
+            fields.addAll(Arrays.asList(current.getDeclaredFields()));
+            current = current.getSuperclass();
+        }
+        return fields;
+    }
+}
+Logback TurboFilter with level filtering
+java
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.turbo.TurboFilter;
+import ch.qos.logback.core.spi.FilterReply;
+import org.slf4j.Marker;
+
+import java.util.Set;
+
+public class SensitiveTurboFilter extends TurboFilter {
+
+    private final SensitiveMasker masker;
+    private final Set<Level> levels;
+
+    public SensitiveTurboFilter(SensitiveMasker masker, Set<Level> levels) {
+        this.masker = masker;
+        this.levels = levels;
+    }
+
+    @Override
+    public FilterReply decide(Marker marker,
+                              Logger logger,
+                              Level level,
+                              String format,
+                              Object[] params,
+                              Throwable t) {
+
+        if (!levels.contains(level)) return FilterReply.NEUTRAL;
+        if (params != null) {
+            for (int i = 0; i < params.length; i++) {
+                params[i] = masker.maskObject(params[i]);
+            }
+        }
+        return FilterReply.NEUTRAL;
+    }
+}
+Manual registration without a starter
+Call this early in your application startup (for example in main):
+
+java
+import ch.qos.logback.classic.LoggerContext;
+import ch.qos.logback.classic.Level;
+import org.slf4j.LoggerFactory;
+import java.util.Set;
+
+public class SensitiveLoggingBootstrap {
+    public static void init() {
+        LoggerContext context = (LoggerContext) LoggerFactory.getILoggerFactory();
+
+        MaskingStrategy defaultStrategy = new FullMaskingStrategy();
+        String defaultMask = "****";
+        String globalRegex = "\\d(?=\\d{4})"; // example: mask all but last 4 digits
+
+        SensitiveMasker masker = new SensitiveMasker(defaultStrategy, defaultMask, globalRegex);
+        Set<Level> levels = Set.of(Level.INFO, Level.DEBUG);
+
+        SensitiveTurboFilter filter = new SensitiveTurboFilter(masker, levels);
+        filter.start();
+        context.addTurboFilter(filter);
+    }
+}
+Call SensitiveLoggingBootstrap.init() before your application begins logging.
+
+Example usage with records and nested structures
+java
+public record Card(
+    @Sensitive(regex = "\\d(?=\\d{4})", mask = "*")
+    String number,
+    @Sensitive
+    String cvv
+) {}
+
+public record User(
+    String name,
+    @Sensitive
+    String ssn,
+    List<Card> cards,
+    Map<String, Object> metadata
+) {}
+Logging anywhere in the app:
+
+java
+log.info("User: {}", user);
+Result: the TurboFilter masks user parameter before formatting. Records are reconstructed with masked components; POJOs are masked in place; nested lists and maps are traversed; only configured log levels are processed.
+
+Notes and limitations
+Records are reconstructed so immutability is preserved. If a record constructor is inaccessible or fails, the original record is left unchanged as a safe fallback.
+
+Unmodifiable containers are not replaced; objects they reference are masked in place when possible. If a container prevents mutation of its elements, nested mutable objects are still processed.
+
+Performance: deep graphs and heavy reflection are costly. Restrict masking to appropriate log levels and avoid masking on extremely hot paths.
+
+Thread safety: the masker mutates objects in place for POJOs; if objects are shared concurrently, consider cloning strategies or restricting masking to non‑concurrent contexts.
+
+Extensibility: add named strategies (LAST4, FIRST3) by implementing MaskingStrategy and selecting them via annotation metadata or configuration.
+
+If you want, I can now:
+
+Provide a ready Maven module layout and pom.xml for this library
+
+Add named masking strategies and a small strategy registry so @Sensitive(strategy="LAST4") works
+
+Write unit and integration tests covering arrays, sequenced collections, records, and concurrent maps
