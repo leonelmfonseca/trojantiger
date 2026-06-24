@@ -1,0 +1,324 @@
+package com.yourcompany.sensitive.meta;
+
+import com.yourcompany.sensitive.annotation.Sensitive;
+
+import java.lang.reflect.AccessibleObject;
+import java.lang.reflect.Field;
+import java.lang.reflect.RecordComponent;
+import java.util.Optional;
+
+public final class FieldMetadata {
+
+    private final AccessibleObject accessor; // Field or Method (record accessor)
+    private final boolean sensitive;
+    private final String mask;
+    private final String regex;
+
+    private FieldMetadata(AccessibleObject accessor, boolean sensitive, String mask, String regex) {
+        this.accessor = accessor;
+        this.sensitive = sensitive;
+        this.mask = mask;
+        this.regex = regex;
+    }
+
+    public static FieldMetadata forField(Field field) {
+        Sensitive s = field.getAnnotation(Sensitive.class);
+        return new FieldMetadata(field,
+                s != null,
+                s != null ? s.mask() : "",
+                s != null ? s.regex() : "");
+    }
+
+    public static FieldMetadata forRecordComponent(RecordComponent rc) {
+        Sensitive s = rc.getAccessor().getAnnotation(Sensitive.class);
+        return new FieldMetadata(rc.getAccessor(),
+                s != null,
+                s != null ? s.mask() : "",
+                s != null ? s.regex() : "");
+    }
+
+    public AccessibleObject accessor() { return accessor; }
+    public boolean isSensitive() { return sensitive; }
+    public Optional<String> mask() { return mask == null || mask.isEmpty() ? Optional.empty() : Optional.of(mask); }
+    public Optional<String> regex() { return regex == null || regex.isEmpty() ? Optional.empty() : Optional.of(regex); }
+}
+
+
+package com.yourcompany.sensitive.meta;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.RecordComponent;
+import java.util.List;
+
+public final class ClassMetadata {
+
+    private final Class<?> type;
+    private final boolean record;
+    private final Constructor<?> recordConstructor; // may be null
+    private final List<RecordComponent> recordComponents;
+    private final List<Field> fields;
+    private final List<FieldMetadata> fieldMetadata;
+
+    public ClassMetadata(Class<?> type,
+                         boolean record,
+                         Constructor<?> recordConstructor,
+                         List<RecordComponent> recordComponents,
+                         List<Field> fields,
+                         List<FieldMetadata> fieldMetadata) {
+        this.type = type;
+        this.record = record;
+        this.recordConstructor = recordConstructor;
+        this.recordComponents = recordComponents;
+        this.fields = fields;
+        this.fieldMetadata = fieldMetadata;
+    }
+
+    public Class<?> type() { return type; }
+    public boolean isRecord() { return record; }
+    public Constructor<?> recordConstructor() { return recordConstructor; }
+    public List<RecordComponent> recordComponents() { return recordComponents; }
+    public List<Field> fields() { return fields; }
+    public List<FieldMetadata> fieldMetadata() { return fieldMetadata; }
+}
+
+
+package com.yourcompany.sensitive.meta;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.RecordComponent;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class MetadataRegistry {
+
+    private final Map<Class<?>, ClassMetadata> cache = new ConcurrentHashMap<>();
+
+    public ClassMetadata getOrAnalyze(Class<?> type) {
+        return cache.computeIfAbsent(type, this::analyzeClass);
+    }
+
+    private ClassMetadata analyzeClass(Class<?> type) {
+        if (type.isRecord()) {
+            RecordComponent[] components = type.getRecordComponents();
+            List<RecordComponent> rcList = Arrays.asList(components);
+            List<FieldMetadata> fm = new ArrayList<>(components.length);
+            for (RecordComponent rc : components) {
+                fm.add(FieldMetadata.forRecordComponent(rc));
+            }
+            Constructor<?> ctor = null;
+            try {
+                Class<?>[] paramTypes = Arrays.stream(components)
+                        .map(RecordComponent::getType)
+                        .toArray(Class[]::new);
+                ctor = type.getDeclaredConstructor(paramTypes);
+                ctor.setAccessible(true);
+            } catch (Exception ignored) {}
+            return new ClassMetadata(type, true, ctor, rcList, List.of(), fm);
+        } else {
+            List<Field> fields = getAllFields(type);
+            List<FieldMetadata> fm = new ArrayList<>(fields.size());
+            for (Field f : fields) {
+                f.setAccessible(true);
+                fm.add(FieldMetadata.forField(f));
+            }
+            return new ClassMetadata(type, false, null, List.of(), fields, fm);
+        }
+    }
+
+    private List<Field> getAllFields(Class<?> type) {
+        List<Field> fields = new ArrayList<>();
+        Class<?> current = type;
+        while (current != null && current != Object.class) {
+            fields.addAll(Arrays.asList(current.getDeclaredFields()));
+            current = current.getSuperclass();
+        }
+        return fields;
+    }
+}
+
+
+package com.yourcompany.sensitive.meta;
+
+import io.github.classgraph.ClassGraph;
+import io.github.classgraph.ClassInfo;
+import io.github.classgraph.ScanResult;
+
+public class MetadataScanner {
+
+    private final MetadataRegistry registry;
+
+    public MetadataScanner(MetadataRegistry registry) {
+        this.registry = registry;
+    }
+
+    public void scan(String... basePackages) {
+        try (ScanResult scan = new ClassGraph()
+                .enableClassInfo()
+                .acceptPackages(basePackages)
+                .scan()) {
+
+            for (ClassInfo ci : scan.getAllClasses()) {
+                try {
+                    Class<?> clazz = ci.loadClass();
+                    if (!clazz.isPrimitive() && !clazz.isInterface() && !clazz.isAnnotation()) {
+                        registry.getOrAnalyze(clazz);
+                    }
+                } catch (Throwable ignored) {
+                    // ignore classes that cannot be loaded
+                }
+            }
+        }
+    }
+}
+
+
+package com.yourcompany.sensitive.masking;
+
+import com.yourcompany.sensitive.meta.ClassMetadata;
+import com.yourcompany.sensitive.meta.FieldMetadata;
+import com.yourcompany.sensitive.meta.MetadataRegistry;
+
+import java.lang.reflect.Array;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.*;
+
+public class SensitiveMasker {
+
+    private final MaskingStrategy defaultStrategy;
+    private final String defaultMask;
+    private final String globalRegex;
+    private final MetadataRegistry metadataRegistry;
+
+    public SensitiveMasker(MaskingStrategy defaultStrategy,
+                           String defaultMask,
+                           String globalRegex,
+                           MetadataRegistry metadataRegistry) {
+        this.defaultStrategy = defaultStrategy;
+        this.defaultMask = defaultMask;
+        this.globalRegex = globalRegex;
+        this.metadataRegistry = metadataRegistry;
+    }
+
+    public Object maskObject(Object obj) {
+        return maskObject(obj, new IdentityHashMap<>());
+    }
+
+    private Object maskObject(Object obj, Map<Object, Boolean> visited) {
+        if (obj == null) return null;
+        if (isPrimitiveLike(obj)) return obj;
+        if (visited.containsKey(obj)) return obj;
+        visited.put(obj, Boolean.TRUE);
+
+        Class<?> clazz = obj.getClass();
+
+        // Arrays
+        if (clazz.isArray()) {
+            int len = Array.getLength(obj);
+            for (int i = 0; i < len; i++) {
+                Object element = Array.get(obj, i);
+                Array.set(obj, i, maskObject(element, visited));
+            }
+            return obj;
+        }
+
+        // Collections
+        if (obj instanceof Collection<?> col) {
+            for (Object element : col) maskObject(element, visited);
+            return obj;
+        }
+
+        // Maps
+        if (obj instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> e : map.entrySet()) maskObject(e.getValue(), visited);
+            return obj;
+        }
+
+        // Optional
+        if (obj instanceof Optional<?> opt) {
+            opt.ifPresent(v -> maskObject(v, visited));
+            return obj;
+        }
+
+        // Use metadata for POJO or record
+        ClassMetadata meta = metadataRegistry.getOrAnalyze(clazz);
+        if (meta.isRecord()) {
+            return maskRecord(obj, meta, visited);
+        } else {
+            return maskPojo(obj, meta, visited);
+        }
+    }
+
+    private Object maskRecord(Object record, ClassMetadata meta, Map<Object, Boolean> visited) {
+        var components = meta.recordComponents();
+        var fm = meta.fieldMetadata();
+        Object[] args = new Object[components.size()];
+
+        for (int i = 0; i < components.size(); i++) {
+            var rc = components.get(i);
+            var fmd = fm.get(i);
+            try {
+                Method accessor = (Method) fmd.accessor();
+                Object value = accessor.invoke(record);
+                if (fmd.isSensitive() && value instanceof String s) {
+                    args[i] = applyMask(fmd, s);
+                } else {
+                    args[i] = maskObject(value, visited);
+                }
+            } catch (Exception e) {
+                args[i] = null;
+            }
+        }
+
+        try {
+            if (meta.recordConstructor() != null) {
+                return meta.recordConstructor().newInstance(args);
+            }
+        } catch (Exception ignored) {}
+        return record;
+    }
+
+    private Object maskPojo(Object obj, ClassMetadata meta, Map<Object, Boolean> visited) {
+        List<Field> fields = meta.fields();
+        List<FieldMetadata> fm = meta.fieldMetadata();
+
+        for (int i = 0; i < fields.size(); i++) {
+            Field field = fields.get(i);
+            FieldMetadata fmd = fm.get(i);
+            try {
+                Object value = field.get(obj);
+                if (fmd.isSensitive() && value instanceof String s) {
+                    field.set(obj, applyMask(fmd, s));
+                } else {
+                    maskObject(value, visited);
+                }
+            } catch (Exception ignored) {}
+        }
+        return obj;
+    }
+
+    private String applyMask(FieldMetadata fmd, String value) {
+        String maskPattern = fmd.mask().orElse(defaultMask);
+        String fieldRegex = fmd.regex().orElse(null);
+
+        if (fieldRegex != null && !fieldRegex.isEmpty()) {
+            return new RegexMaskingStrategy(fieldRegex).mask(value, maskPattern);
+        }
+        if (globalRegex != null && !globalRegex.isEmpty()) {
+            return new RegexMaskingStrategy(globalRegex).mask(value, maskPattern);
+        }
+        return defaultStrategy.mask(value, maskPattern);
+    }
+
+    private boolean isPrimitiveLike(Object obj) {
+        Class<?> c = obj.getClass();
+        return c.isPrimitive()
+                || obj instanceof String
+                || obj instanceof Number
+                || obj instanceof Boolean
+                || obj instanceof Character
+                || c.isEnum();
+    }
+}
