@@ -322,3 +322,54 @@ public class SensitiveMasker {
                 || c.isEnum();
     }
 }
+
+
+package com.yourcompany.sensitive.masking;
+
+import java.lang.reflect.RecordComponent;
+import java.util.Objects;
+
+public final class MaskedRecordView {
+
+    private final Object originalRecord;
+    private final Class<?> recordClass;
+    private final RecordComponent[] components;
+    private final String[] maskedComponentStrings;
+
+    public MaskedRecordView(Object originalRecord,
+                            RecordComponent[] components,
+                            String[] maskedComponentStrings) {
+        this.originalRecord = Objects.requireNonNull(originalRecord);
+        this.recordClass = originalRecord.getClass();
+        this.components = components.clone();
+        this.maskedComponentStrings = maskedComponentStrings.clone();
+    }
+
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(recordClass.getSimpleName()).append("[");
+        for (int i = 0; i < components.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(components[i].getName()).append("=");
+            sb.append(maskedComponentStrings[i]);
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    public Object original() { return originalRecord; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof MaskedRecordView)) return false;
+        MaskedRecordView that = (MaskedRecordView) o;
+        return originalRecord.equals(that.originalRecord);
+    }
+
+    @Override
+    public int hashCode() {
+        return originalRecord.hashCode();
+    }
+}
