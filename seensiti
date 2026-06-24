@@ -412,3 +412,113 @@ public final class MaskedRecordView {
         return originalRecord.hashCode();
     }
 }
+
+
+package com.yourcompany.sensitive.config;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.LoggerContext;
+import com.yourcompany.sensitive.logback.SensitiveTurboFilter;
+import com.yourcompany.sensitive.masking.*;
+import com.yourcompany.sensitive.meta.MetadataRegistry;
+import com.yourcompany.sensitive.meta.MetadataScanner;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import jakarta.annotation.PostConstruct;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@Configuration
+@ConditionalOnClass(LoggerContext.class)
+@EnableConfigurationProperties(SensitiveProperties.class)
+@ConditionalOnProperty(prefix = "sensitive", name = "masking-enabled", havingValue = "true", matchIfMissing = true)
+public class SensitiveLoggingAutoConfiguration {
+
+    private final SensitiveProperties properties;
+
+    public SensitiveLoggingAutoConfiguration(SensitiveProperties properties) {
+        this.properties = properties;
+    }
+
+    @Bean
+    public MetadataRegistry metadataRegistry() {
+        return new MetadataRegistry();
+    }
+
+    @Bean
+    public MetadataScanner metadataScanner(MetadataRegistry registry) {
+        return new MetadataScanner(registry);
+    }
+
+    @Bean
+    public SensitiveMasker sensitiveMasker(MetadataRegistry registry) {
+        MaskingStrategy defaultStrategy = new FullMaskingStrategy();
+        String defaultMask = properties.getDefaultMask();
+        String globalRegex = properties.getDefaultRegex();
+        return new SensitiveMasker(defaultStrategy, defaultMask, globalRegex, registry);
+    }
+
+    @PostConstruct
+    public void registerFilter() {
+        LoggerContext context = (LoggerContext) LoggerFactory.getILoggerFactory();
+
+        // Pre-scan packages if configured
+        if (properties.getScanPackages() != null && !properties.getScanPackages().isEmpty()) {
+            MetadataScanner scanner = metadataScanner(metadataRegistry());
+            scanner.scan(properties.getScanPackages().toArray(String[]::new));
+        }
+
+        SensitiveMasker masker = sensitiveMasker(metadataRegistry());
+
+        Set<Level> levels = properties.getLogLevels().stream()
+                .map(String::toUpperCase)
+                .map(Level::valueOf)
+                .collect(Collectors.toSet());
+
+        SensitiveTurboFilter filter = new SensitiveTurboFilter(masker, levels);
+        filter.start();
+        context.addTurboFilter(filter);
+    }
+}
+
+
+package com.yourcompany.sensitive.bootstrap;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.LoggerContext;
+import com.yourcompany.sensitive.logback.SensitiveTurboFilter;
+import com.yourcompany.sensitive.masking.*;
+import com.yourcompany.sensitive.meta.MetadataRegistry;
+import com.yourcompany.sensitive.meta.MetadataScanner;
+import org.slf4j.LoggerFactory;
+
+import java.util.Set;
+
+public final class SensitiveLoggingBootstrap {
+
+    public static void init(String[] scanPackages) {
+        LoggerContext context = (LoggerContext) LoggerFactory.getILoggerFactory();
+
+        MetadataRegistry registry = new MetadataRegistry();
+        if (scanPackages != null && scanPackages.length > 0) {
+            new MetadataScanner(registry).scan(scanPackages);
+        }
+
+        MaskingStrategy defaultStrategy = new FullMaskingStrategy();
+        String defaultMask = "****";
+        String globalRegex = "\\d(?=\\d{4})";
+
+        SensitiveMasker masker = new SensitiveMasker(defaultStrategy, defaultMask, globalRegex, registry);
+
+        Set<Level> levels = Set.of(Level.INFO, Level.DEBUG);
+
+        SensitiveTurboFilter filter = new SensitiveTurboFilter(masker, levels);
+        filter.start();
+        context.addTurboFilter(filter);
+    }
+}
