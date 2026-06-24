@@ -4,6 +4,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.LoggerContext;
 import ch.qos.logback.core.read.ListAppender;
+import com.yourcompany.sensitive.annotation.Sensitive;
 import com.yourcompany.sensitive.logback.SensitiveTurboFilter;
 import com.yourcompany.sensitive.masking.FullMaskingStrategy;
 import com.yourcompany.sensitive.masking.SensitiveMasker;
@@ -16,6 +17,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -24,27 +26,45 @@ import static org.assertj.core.api.Assertions.assertThat;
  * attaches a ListAppender to capture formatted log messages, and asserts that
  * sensitive information is masked in the final formatted output.
  *
- * This test assumes the starter classes (MetadataRegistry, MetadataScanner,
- * SensitiveMasker, SensitiveTurboFilter, FullMaskingStrategy, RegexMaskingStrategy)
- * are present on the classpath as implemented in the starter.
+ * This test assumes the non-mutating masking pipeline is in place:
+ * - SensitiveMasker returns masked views/strings and does NOT mutate originals.
+ * - MetadataRegistry/MetadataScanner detect @Sensitive annotations.
+ * - SensitiveTurboFilter replaces log parameters with masker.maskObject(...) results.
  */
-public class SensitiveLoggingIntegrationTest {
+public class SensitiveMaskerNonMutatingIntegrationTest {
 
     private static final LoggerContext CONTEXT = (LoggerContext) LoggerFactory.getILoggerFactory();
-    private final Logger testLogger = (Logger) LoggerFactory.getLogger(SensitiveLoggingIntegrationTest.class);
+    private final Logger testLogger = (Logger) LoggerFactory.getLogger(SensitiveMaskerNonMutatingIntegrationTest.class);
 
     private ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> listAppender;
     private SensitiveTurboFilter turboFilter;
 
-    // Example record and POJO used for logging
-    public record Card(String number, String cvv, int expiryYear) {}
+    // Annotated record: mark sensitive components including a primitive component
+    public record Card(
+        @Sensitive(regex = "\\d(?=\\d{4})", mask = "*") String number,
+        @Sensitive String cvv,
+        @Sensitive int secretCode, // primitive marked sensitive
+        int expiryYear
+    ) {}
+
+    // POJO with annotated sensitive fields (String and primitive)
     public static class User {
         public String name;
+        @Sensitive
         public String ssn;
+        @Sensitive
+        public int pin; // primitive sensitive field
         public Card[] cards;
         public Map<String, Object> metadata;
-        public User(String name, String ssn, Card[] cards, Map<String,Object> metadata) {
-            this.name = name; this.ssn = ssn; this.cards = cards; this.metadata = metadata;
+        public Optional<String> note;
+
+        public User(String name, String ssn, int pin, Card[] cards, Map<String,Object> metadata, Optional<String> note) {
+            this.name = name;
+            this.ssn = ssn;
+            this.pin = pin;
+            this.cards = cards;
+            this.metadata = metadata;
+            this.note = note;
         }
     }
 
@@ -53,9 +73,11 @@ public class SensitiveLoggingIntegrationTest {
         // Prepare metadata registry and optional pre-scan (scan current package)
         MetadataRegistry registry = new MetadataRegistry();
         MetadataScanner scanner = new MetadataScanner(registry);
-        // optional: scanner.scan("com.yourcompany"); // pre-warm if desired
+        // Optional: pre-warm registry for test classes
+        scanner.scan(this.getClass().getPackageName());
 
         // Create masker and turbo filter (masking enabled for INFO)
+        // default mask "****", global regex to keep last 4 digits visible
         SensitiveMasker masker = new SensitiveMasker(new FullMaskingStrategy(), "****", "\\d(?=\\d{4})", registry);
         turboFilter = new SensitiveTurboFilter(masker, java.util.Set.of(Level.INFO));
         turboFilter.start();
@@ -79,14 +101,27 @@ public class SensitiveLoggingIntegrationTest {
     }
 
     @Test
-    void logsAreMasked_forRecordsCollectionsAndMaps() {
+    void logsAreMasked_forRecordsArraysCollectionsMapsAndPrimitives() {
         // Create sample data containing sensitive-looking values
-        Card card = new Card("4111111111111111", "123", 2026);
-        User user = new User("Alice", "123-45-6789", new Card[]{card},
-                Map.of("primaryCard", card, "notes", "VIP"));
+        Card card = new Card("4111111111111111", "123", 4242, 2026);
+        User user = new User(
+                "Alice",
+                "123-45-6789",
+                9999,
+                new Card[]{card},
+                Map.of("primaryCard", card, "notes", "VIP"),
+                Optional.of("sensitive-note-42")
+        );
+
+        // Keep originals for later assertions (must remain unchanged)
+        String originalNumber = card.number();
+        String originalCvv = card.cvv();
+        int originalSecretCode = card.secretCode();
+        String originalSsn = user.ssn;
+        int originalPin = user.pin;
 
         // Log parameterized message so TurboFilter can intercept params
-        org.slf4j.Logger log = LoggerFactory.getLogger(SensitiveLoggingIntegrationTest.class);
+        org.slf4j.Logger log = LoggerFactory.getLogger(SensitiveMaskerNonMutatingIntegrationTest.class);
         log.info("Processing user: {}", user);
 
         // Grab the formatted message from the ListAppender
@@ -95,18 +130,28 @@ public class SensitiveLoggingIntegrationTest {
 
         String formatted = events.get(0).getFormattedMessage();
 
-        // Basic assertions: original sensitive values should not appear verbatim
-        assertThat(formatted).doesNotContain("4111111111111111");
-        assertThat(formatted).doesNotContain("123-45-6789");
-        assertThat(formatted).doesNotContain("123"); // cvv original should not appear
+        // 1) Raw sensitive values must not appear verbatim in the formatted log
+        assertThat(formatted).doesNotContain(originalNumber);
+        assertThat(formatted).doesNotContain(originalCvv);
+        assertThat(formatted).doesNotContain(String.valueOf(originalSecretCode));
+        assertThat(formatted).doesNotContain(originalSsn);
+        assertThat(formatted).doesNotContain(String.valueOf(originalPin));
+        assertThat(formatted).doesNotContain("sensitive-note-42");
 
-        // Expect masked tokens to appear (default mask "****")
-        assertThat(formatted).contains("****");
+        // 2) Masked tokens should appear (default mask "****" or mask char from annotation)
+        assertThat(formatted).contains("****");      // default mask present somewhere
+        assertThat(formatted).contains("1111");      // last 4 digits visible due to regex
+        assertThat(formatted).contains("Alice");     // non-sensitive field still present
 
-        // If regex masking kept last 4 digits visible, assert last 4 are present
-        assertThat(formatted).contains("1111");
+        // 3) Original objects must remain unchanged (non-mutating guarantee)
+        assertThat(card.number()).isEqualTo(originalNumber);
+        assertThat(card.cvv()).isEqualTo(originalCvv);
+        assertThat(card.secretCode()).isEqualTo(originalSecretCode);
+        assertThat(user.ssn).isEqualTo(originalSsn);
+        assertThat(user.pin).isEqualTo(originalPin);
 
-        // Also assert that the log still contains the user's name (non-sensitive)
-        assertThat(formatted).contains("Alice");
+        // 4) Optional masking: ensure optional content was masked in the logged representation
+        assertThat(formatted).doesNotContain("sensitive-note-42");
+        assertThat(formatted).contains("****"); // masked optional content should show mask
     }
 }
