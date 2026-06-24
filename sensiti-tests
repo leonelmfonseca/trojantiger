@@ -1,0 +1,112 @@
+package com.yourcompany.sensitive.test;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.LoggerContext;
+import ch.qos.logback.core.read.ListAppender;
+import com.yourcompany.sensitive.logback.SensitiveTurboFilter;
+import com.yourcompany.sensitive.masking.FullMaskingStrategy;
+import com.yourcompany.sensitive.masking.SensitiveMasker;
+import com.yourcompany.sensitive.meta.MetadataRegistry;
+import com.yourcompany.sensitive.meta.MetadataScanner;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * Integration-style test that registers the SensitiveTurboFilter programmatically,
+ * attaches a ListAppender to capture formatted log messages, and asserts that
+ * sensitive information is masked in the final formatted output.
+ *
+ * This test assumes the starter classes (MetadataRegistry, MetadataScanner,
+ * SensitiveMasker, SensitiveTurboFilter, FullMaskingStrategy, RegexMaskingStrategy)
+ * are present on the classpath as implemented in the starter.
+ */
+public class SensitiveLoggingIntegrationTest {
+
+    private static final LoggerContext CONTEXT = (LoggerContext) LoggerFactory.getILoggerFactory();
+    private final Logger testLogger = (Logger) LoggerFactory.getLogger(SensitiveLoggingIntegrationTest.class);
+
+    private ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> listAppender;
+    private SensitiveTurboFilter turboFilter;
+
+    // Example record and POJO used for logging
+    public record Card(String number, String cvv, int expiryYear) {}
+    public static class User {
+        public String name;
+        public String ssn;
+        public Card[] cards;
+        public Map<String, Object> metadata;
+        public User(String name, String ssn, Card[] cards, Map<String,Object> metadata) {
+            this.name = name; this.ssn = ssn; this.cards = cards; this.metadata = metadata;
+        }
+    }
+
+    @BeforeEach
+    void setup() {
+        // Prepare metadata registry and optional pre-scan (scan current package)
+        MetadataRegistry registry = new MetadataRegistry();
+        MetadataScanner scanner = new MetadataScanner(registry);
+        // optional: scanner.scan("com.yourcompany"); // pre-warm if desired
+
+        // Create masker and turbo filter (masking enabled for INFO)
+        SensitiveMasker masker = new SensitiveMasker(new FullMaskingStrategy(), "****", "\\d(?=\\d{4})", registry);
+        turboFilter = new SensitiveTurboFilter(masker, java.util.Set.of(Level.INFO));
+        turboFilter.start();
+        CONTEXT.addTurboFilter(turboFilter);
+
+        // Attach ListAppender to capture formatted messages for this logger
+        listAppender = new ListAppender<>();
+        listAppender.start();
+        testLogger.addAppender(listAppender);
+        testLogger.setLevel(Level.INFO);
+    }
+
+    @AfterEach
+    void tearDown() {
+        testLogger.detachAppender(listAppender);
+        listAppender.stop();
+        if (turboFilter != null) {
+            CONTEXT.getTurboFilterList().remove(turboFilter);
+            turboFilter.stop();
+        }
+    }
+
+    @Test
+    void logsAreMasked_forRecordsCollectionsAndMaps() {
+        // Create sample data containing sensitive-looking values
+        Card card = new Card("4111111111111111", "123", 2026);
+        User user = new User("Alice", "123-45-6789", new Card[]{card},
+                Map.of("primaryCard", card, "notes", "VIP"));
+
+        // Log parameterized message so TurboFilter can intercept params
+        org.slf4j.Logger log = LoggerFactory.getLogger(SensitiveLoggingIntegrationTest.class);
+        log.info("Processing user: {}", user);
+
+        // Grab the formatted message from the ListAppender
+        List<ch.qos.logback.classic.spi.ILoggingEvent> events = listAppender.list;
+        assertThat(events).isNotEmpty();
+
+        String formatted = events.get(0).getFormattedMessage();
+
+        // Basic assertions: original sensitive values should not appear verbatim
+        assertThat(formatted).doesNotContain("4111111111111111");
+        assertThat(formatted).doesNotContain("123-45-6789");
+        assertThat(formatted).doesNotContain("123"); // cvv original should not appear
+
+        // Expect masked tokens to appear (default mask "****")
+        assertThat(formatted).contains("****");
+
+        // If regex masking kept last 4 digits visible, assert last 4 are present
+        assertThat(formatted).contains("1111");
+
+        // Also assert that the log still contains the user's name (non-sensitive)
+        assertThat(formatted).contains("Alice");
+    }
+}
