@@ -202,6 +202,10 @@ public class SensitiveMasker {
         this.metadataRegistry = metadataRegistry;
     }
 
+    /**
+     * Mask an object graph. This method is safe to call from the TurboFilter.
+     * It mutates POJOs in place and returns wrappers for records.
+     */
     public Object maskObject(Object obj) {
         return maskObject(obj, new IdentityHashMap<>());
     }
@@ -214,7 +218,7 @@ public class SensitiveMasker {
 
         Class<?> clazz = obj.getClass();
 
-        // Arrays
+        // Arrays (handles primitive and object arrays)
         if (clazz.isArray()) {
             int len = Array.getLength(obj);
             for (int i = 0; i < len; i++) {
@@ -224,15 +228,17 @@ public class SensitiveMasker {
             return obj;
         }
 
-        // Collections
+        // Collections (List, Set, Queue, Deque, SequencedCollection)
         if (obj instanceof Collection<?> col) {
             for (Object element : col) maskObject(element, visited);
             return obj;
         }
 
-        // Maps
+        // Maps (mask values)
         if (obj instanceof Map<?, ?> map) {
-            for (Map.Entry<?, ?> e : map.entrySet()) maskObject(e.getValue(), visited);
+            for (Map.Entry<?, ?> e : map.entrySet()) {
+                e.setValue(maskObject(e.getValue(), visited));
+            }
             return obj;
         }
 
@@ -254,7 +260,7 @@ public class SensitiveMasker {
     private Object maskRecord(Object record, ClassMetadata meta, Map<Object, Boolean> visited) {
         var components = meta.recordComponents();
         var fm = meta.fieldMetadata();
-        Object[] args = new Object[components.size()];
+        String[] maskedStrings = new String[components.size()];
 
         for (int i = 0; i < components.size(); i++) {
             var rc = components.get(i);
@@ -262,22 +268,19 @@ public class SensitiveMasker {
             try {
                 Method accessor = (Method) fmd.accessor();
                 Object value = accessor.invoke(record);
-                if (fmd.isSensitive() && value instanceof String s) {
-                    args[i] = applyMask(fmd, s);
+
+                if (fmd.isSensitive()) {
+                    maskedStrings[i] = applyMaskForAnyType(fmd, value, visited);
                 } else {
-                    args[i] = maskObject(value, visited);
+                    Object maskedValue = maskObject(value, visited);
+                    maskedStrings[i] = String.valueOf(maskedValue);
                 }
             } catch (Exception e) {
-                args[i] = null;
+                maskedStrings[i] = "<error>";
             }
         }
 
-        try {
-            if (meta.recordConstructor() != null) {
-                return meta.recordConstructor().newInstance(args);
-            }
-        } catch (Exception ignored) {}
-        return record;
+        return new MaskedRecordView(record, components.toArray(new java.lang.reflect.RecordComponent[0]), maskedStrings);
     }
 
     private Object maskPojo(Object obj, ClassMetadata meta, Map<Object, Boolean> visited) {
@@ -289,8 +292,21 @@ public class SensitiveMasker {
             FieldMetadata fmd = fm.get(i);
             try {
                 Object value = field.get(obj);
-                if (fmd.isSensitive() && value instanceof String s) {
-                    field.set(obj, applyMask(fmd, s));
+                if (fmd.isSensitive()) {
+                    // mask any type by converting to masked string and set if field is String,
+                    // otherwise attempt to mask nested structure and leave non-String fields unchanged
+                    if (value instanceof String s) {
+                        field.set(obj, applyMaskForAnyType(fmd, s, visited));
+                    } else {
+                        // For non-String sensitive fields: try to mask nested structure and set string representation if field is String
+                        Object masked = maskObject(value, visited);
+                        if (field.getType().equals(String.class)) {
+                            field.set(obj, String.valueOf(masked));
+                        } else {
+                            // cannot set non-string typed field to masked string; leave original value but ensure nested masking
+                            // nested masking already applied via maskObject
+                        }
+                    }
                 } else {
                     maskObject(value, visited);
                 }
@@ -299,17 +315,40 @@ public class SensitiveMasker {
         return obj;
     }
 
-    private String applyMask(FieldMetadata fmd, String value) {
-        String maskPattern = fmd.mask().orElse(defaultMask);
-        String fieldRegex = fmd.regex().orElse(null);
+    private String applyMaskForAnyType(FieldMetadata fmd, Object value, Map<Object, Boolean> visited) {
+        if (value == null) return "null";
 
-        if (fieldRegex != null && !fieldRegex.isEmpty()) {
-            return new RegexMaskingStrategy(fieldRegex).mask(value, maskPattern);
+        // Strings
+        if (value instanceof String s) {
+            String maskPattern = fmd.mask().orElse(defaultMask);
+            String fieldRegex = fmd.regex().orElse(null);
+            if (fieldRegex != null && !fieldRegex.isEmpty()) {
+                return new RegexMaskingStrategy(fieldRegex).mask(s, maskPattern);
+            }
+            if (globalRegex != null && !globalRegex.isEmpty()) {
+                return new RegexMaskingStrategy(globalRegex).mask(s, maskPattern);
+            }
+            return defaultStrategy.mask(s, maskPattern);
         }
-        if (globalRegex != null && !globalRegex.isEmpty()) {
-            return new RegexMaskingStrategy(globalRegex).mask(value, maskPattern);
+
+        // Primitive-like
+        Class<?> vt = value.getClass();
+        if (vt.isPrimitive() || value instanceof Number || value instanceof Boolean || value instanceof Character || vt.isEnum()) {
+            String str = String.valueOf(value);
+            String maskPattern = fmd.mask().orElse(defaultMask);
+            String fieldRegex = fmd.regex().orElse(null);
+            if (fieldRegex != null && !fieldRegex.isEmpty()) {
+                return new RegexMaskingStrategy(fieldRegex).mask(str, maskPattern);
+            }
+            if (globalRegex != null && !globalRegex.isEmpty()) {
+                return new RegexMaskingStrategy(globalRegex).mask(str, maskPattern);
+            }
+            return defaultStrategy.mask(str, maskPattern);
         }
-        return defaultStrategy.mask(value, maskPattern);
+
+        // Complex object: recursively mask and return its string representation
+        Object masked = maskObject(value, visited);
+        return String.valueOf(masked);
     }
 
     private boolean isPrimitiveLike(Object obj) {
