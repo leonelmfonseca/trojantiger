@@ -1,149 +1,713 @@
-package com.azqore.payments.masking.core;
+package com.leonelmfonseca.logmasker.masking;
 
-import ch.qos.logback.classic.Level;
-import ch.qos.logback.classic.Logger;
-import ch.qos.logback.classic.LoggerContext;
-import ch.qos.logback.core.read.ListAppender;
-import com.azqore.payments.masking.annotation.Sensitive;
-import com.azqore.payments.masking.logback.SensitiveTurboFilter;
-import com.azqore.payments.masking.masking.FullMaskingStrategy;
-import com.azqore.payments.masking.masking.SensitiveMasker;
-import com.azqore.payments.masking.meta.MetadataRegistry;
-import com.azqore.payments.masking.meta.MetadataScanner;
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.math.BigDecimal;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.test.context.SpringBootTest;
 
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import com.leonelmfonseca.logmasker.masking.testmodel.Car;
+import com.leonelmfonseca.logmasker.masking.testmodel.DataStructures;
+import com.leonelmfonseca.logmasker.masking.testmodel.Dealership;
+import com.leonelmfonseca.logmasker.masking.testmodel.DeepSecret;
+import com.leonelmfonseca.logmasker.masking.testmodel.Garage;
+import com.leonelmfonseca.logmasker.masking.testmodel.MiddleLayer;
+import com.leonelmfonseca.logmasker.masking.testmodel.TopContainer;
+import com.leonelmfonseca.logmasker.masking.testmodel.TreeNode;
 
-import static org.assertj.core.api.Assertions.assertThat;
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.LoggerContext;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.AppenderBase;
 
-public class SensitiveMaskerFullMaskingDemoTest {
+@SpringBootTest
+class LoggingMaskingTest {
 
-    private static final LoggerContext CONTEXT = (LoggerContext) LoggerFactory.getILoggerFactory();
-
-    // Do NOT create the logger as a field initialized at class load time.
-    // Create it in setup AFTER the TurboFilter is registered.
+    private MemoryAppender memoryAppender;
     private Logger testLogger;
 
-    private ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> listAppender;
-    private SensitiveTurboFilter turboFilter;
-
-    // Annotated record: mark sensitive components including a primitive component
-    public record Card(
-        @Sensitive(regex = "\\d(?=\\d{4})", mask = "*") String number,
-        @Sensitive String cvv,
-        @Sensitive int secretCode, // primitive marked sensitive
-        int expiryYear
-    ) {}
-
-    // POJO with annotated sensitive fields (String and primitive)
-    public static class User {
-        public String name;
-        @Sensitive
-        public String ssn;
-        @Sensitive
-        public int pin; // primitive sensitive field
-        public Card[] cards;
-        public Map<String, Object> metadata;
-        public Optional<String> note;
-
-        public User(String name, String ssn, int pin, Card[] cards, Map<String,Object> metadata, Optional<String> note) {
-            this.name = name;
-            this.ssn = ssn;
-            this.pin = pin;
-            this.cards = cards;
-            this.metadata = metadata;
-            this.note = note;
-        }
-    }
-
     @BeforeEach
-    void setup() {
-        // 1) Prepare metadata registry and pre-scan the test package so record component annotations are discovered
-        MetadataRegistry registry = new MetadataRegistry();
-        MetadataScanner scanner = new MetadataScanner(registry);
-        scanner.scan(this.getClass().getPackageName()); // pre-warm metadata for test classes
-
-        // 2) Create masker and turbo filter (masking enabled for INFO)
-        SensitiveMasker masker = new SensitiveMasker(new FullMaskingStrategy(), "****", "\\d(?=\\d{4})", registry);
-        turboFilter = new SensitiveTurboFilter(masker, java.util.Set.of(Level.INFO));
-
-        // 3) Register the filter with Logback BEFORE creating the logger or attaching appenders
-        turboFilter.start();
-        CONTEXT.addTurboFilter(turboFilter);
-
-        // 4) Now create the logger and attach a ListAppender to capture formatted messages
-        testLogger = (Logger) LoggerFactory.getLogger(SensitiveMaskerFullMaskingDemoTest.class);
-        listAppender = new ListAppender<>();
-        listAppender.start();
-        testLogger.addAppender(listAppender);
+    void setUp() {
+        testLogger = (Logger) LoggerFactory.getLogger(LoggingMaskingTest.class);
+        memoryAppender = new MemoryAppender();
+        memoryAppender.setContext((LoggerContext) LoggerFactory.getILoggerFactory());
+        memoryAppender.start();
+        testLogger.addAppender(memoryAppender);
         testLogger.setLevel(Level.INFO);
     }
 
     @AfterEach
     void tearDown() {
-        if (testLogger != null && listAppender != null) {
-            testLogger.detachAppender(listAppender);
-            listAppender.stop();
-        }
-        if (turboFilter != null) {
-            CONTEXT.getTurboFilterList().remove(turboFilter);
-            turboFilter.stop();
+        if (testLogger != null && memoryAppender != null) {
+            testLogger.detachAppender(memoryAppender);
+            memoryAppender.stop();
         }
     }
 
     @Test
-    void logsAreMasked_forRecordsArraysCollectionsMapsAndPrimitives() {
-        // Create sample data containing sensitive-looking values
-        Card card = new Card("4111111111111111", "123", 4242, 2026);
-        User user = new User(
-                "Alice",
-                "123-45-6789",
-                9999,
-                new Card[]{card},
-                Map.of("primaryCard", card, "notes", "VIP"),
-                Optional.of("sensitive-note-42")
-        );
+    void loggedGarageMasksAddress() {
+        Garage garage = new Garage("123 Main St", 50, List.of());
 
-        // Keep originals for later assertions (must remain unchanged)
-        String originalNumber = card.number();
-        String originalCvv = card.cvv();
-        int originalSecretCode = card.secretCode();
-        String originalSsn = user.ssn;
-        int originalPin = user.pin;
+        testLogger.info("garage: {}", garage);
 
-        // Log parameterized message so TurboFilter can intercept params
-        org.slf4j.Logger log = LoggerFactory.getLogger(SensitiveMaskerFullMaskingDemoTest.class);
-        log.info("Processing user: {}", user);
-
-        // Grab the formatted message from the ListAppender
-        List<ch.qos.logback.classic.spi.ILoggingEvent> events = listAppender.list;
-        assertThat(events).isNotEmpty();
-
-        String formatted = events.get(0).getFormattedMessage();
-
-        // 1) Raw sensitive values must not appear verbatim in the formatted log
-        assertThat(formatted).doesNotContain(originalNumber);
-        assertThat(formatted).doesNotContain(originalCvv);
-        assertThat(formatted).doesNotContain(String.valueOf(originalSecretCode));
-        assertThat(formatted).doesNotContain(originalSsn);
-        assertThat(formatted).doesNotContain(String.valueOf(originalPin));
-        assertThat(formatted).doesNotContain("sensitive-note-42");
-
-        // 2) Masked tokens should appear (default mask "****" or mask char from annotation)
-        assertThat(formatted).contains("****");      // default mask present somewhere
-        assertThat(formatted).contains("1111");      // last 4 digits visible due to regex
-        assertThat(formatted).contains("Alice");     // non-sensitive field still present
-
-        // 3) Original objects must remain unchanged (non-mutating guarantee)
-        assertThat(card.number()).isEqualTo(originalNumber);
-        assertThat(card.cvv()).isEqualTo(originalCvv);
-        assertThat(card.secretCode()).isEqualTo(originalSecretCode);
-        assertThat(user.ssn).isEqualTo(originalSsn);
-        assertThat(user.pin).isEqualTo(originalPin);
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage).contains("address=1*********t");
     }
+
+    @Test
+    void loggedGarageMasksCapacity() {
+        Garage garage = new Garage("X", 50, List.of());
+
+        testLogger.info("garage: {}", garage);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage).contains("capacity=****");
+    }
+
+    @Test
+    void loggedGarageReplacesCarsWithCustomValue() {
+        Garage garage = new Garage("X", 0, List.of(new Car("Red", BigDecimal.valueOf(100))));
+
+        testLogger.info("garage: {}", garage);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage).contains("cars=***CARS***");
+    }
+
+    @Test
+    void loggedCarMasksPrice() {
+        Car car = new Car("Red", BigDecimal.valueOf(100));
+
+        testLogger.info("car: {}", car);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage)
+            .contains("color=Red")
+            .contains("price=****")
+            .doesNotContain("price=100");
+    }
+
+    @Test
+    void loggedDealershipMasksNameAndNestedCarPrices() {
+        Dealership d = new Dealership("Acme Auto",
+            List.of(new Car("Red", BigDecimal.valueOf(100)), new Car("Blue", BigDecimal.valueOf(200))));
+
+        testLogger.info("Dealership: {}", d);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage)
+            .contains("name=****")
+            .contains("price=****")
+            .contains("color=Red")
+            .doesNotContain("price=100")
+            .doesNotContain("price=200");
+    }
+
+    @Test
+    void multipleLogArgumentsAllMasked() {
+        Garage g1 = new Garage("First Ave", 10, List.of());
+        Garage g2 = new Garage("Second St", 20, List.of());
+
+        testLogger.info("two garages: {} and {}", g1, g2);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage)
+            .contains("address=F*******e")
+            .contains("address=S*******t");
+    }
+
+    @Test
+    void logMessageWithoutMaskedArgsPassesThrough() {
+        testLogger.info("plain message, no objects");
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage).isEqualTo("plain message, no objects");
+    }
+
+    @Test
+    void loggedDeepNestingMasksInnermostSecret() {
+        DeepSecret deep = new DeepSecret("my-secret");
+        MiddleLayer mid = new MiddleLayer(deep, "visible-text");
+        TopContainer top = new TopContainer(mid, "top-name");
+
+        testLogger.info("top: {}", top);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage)
+            .contains("secret=****")
+            .contains("visible=visible-text")
+            .doesNotContain("my-secret");
+    }
+
+    @Test
+    void loggedCycleDoesNotStackOverflow() {
+        TreeNode child = new TreeNode("child", List.of());
+        TreeNode parent = new TreeNode("parent", List.of(child));
+
+        testLogger.info("tree: {}", parent);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage)
+            .contains("label=****")
+            .doesNotContain("label=child");
+    }
+
+    @Test
+    void loggedSetFieldIsReplaced() {
+        DataStructures ds = new DataStructures(
+            Set.of("a", "b"), null, null, null, null, null, null, null);
+
+        testLogger.info("ds: {}", ds);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage).contains("maskedSet=***SET***");
+    }
+
+    @Test
+    void loggedMapFieldIsReplaced() {
+        DataStructures ds = new DataStructures(
+            null, Map.of("k1", 1), null, null, null, null, null, null);
+
+        testLogger.info("ds: {}", ds);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage).contains("maskedMap=***MAP***");
+    }
+
+    @Test
+    void loggedPrimitiveArrayIsReplaced() {
+        DataStructures ds = new DataStructures(
+            null, null, new int[]{10, 20}, null, null, null, null, null);
+
+        testLogger.info("ds: {}", ds);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage).contains("maskedIntArray=***INT_ARR***");
+    }
+
+    @Test
+    void loggedObjectArrayIsReplaced() {
+        Car[] cars = new Car[]{new Car("Red", BigDecimal.valueOf(100))};
+        DataStructures ds = new DataStructures(
+            null, null, null, cars, null, null, null, null);
+
+        testLogger.info("ds: {}", ds);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage).contains("maskedCarArray=***CAR_ARR***");
+    }
+
+    @Test
+    void loggedQueueIsReplaced() {
+        Queue<String> q = new LinkedList<>();
+        q.add("x");
+        DataStructures ds = new DataStructures(
+            null, null, null, null, q, null, null, null);
+
+        testLogger.info("ds: {}", ds);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage).contains("maskedQueue=***QUEUE***");
+    }
+
+    @Test
+    void loggedDequeIsReplaced() {
+        Deque<String> dq = new ArrayDeque<>();
+        dq.add("y");
+        DataStructures ds = new DataStructures(
+            null, null, null, null, null, dq, null, null);
+
+        testLogger.info("ds: {}", ds);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage).contains("maskedDeque=***DEQUE***");
+    }
+
+    @Test
+    void loggedUnannotatedListOfMaskedRecordsMasksTransitively() {
+        List<DeepSecret> secrets = List.of(new DeepSecret("alpha"), new DeepSecret("omega"));
+        DataStructures ds = new DataStructures(
+            null, null, null, null, null, null, null, secrets);
+
+        testLogger.info("ds: {}", ds);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage)
+            .contains("secret=****")
+            .doesNotContain("alpha");
+    }
+
+    @Test
+    void loggedSelfReferringListDoesNotLoop() {
+        TreeNode root = new TreeNode("root", new LinkedList<>());
+        root.getChildren().add(root);
+
+        testLogger.info("tree: {}", root);
+
+        String logMessage = memoryAppender.lastEvent().getFormattedMessage();
+        assertThat(logMessage)
+            .contains("label=****")
+            .contains("(");
+    }
+
+    private static class MemoryAppender extends AppenderBase<ILoggingEvent> {
+        private final List<ILoggingEvent> events = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        @Override
+        protected void append(ILoggingEvent event) {
+            events.add(event);
+        }
+
+        ILoggingEvent lastEvent() {
+            return events.get(events.size() - 1);
+        }
+    }
+}
+
+
+package com.leonelmfonseca.logmasker.masking;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.math.BigDecimal;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+
+import com.leonelmfonseca.logmasker.masking.testmodel.Car;
+import com.leonelmfonseca.logmasker.masking.testmodel.DataStructures;
+import com.leonelmfonseca.logmasker.masking.testmodel.Dealership;
+import com.leonelmfonseca.logmasker.masking.testmodel.DeepSecret;
+import com.leonelmfonseca.logmasker.masking.testmodel.Garage;
+import com.leonelmfonseca.logmasker.masking.testmodel.MiddleLayer;
+import com.leonelmfonseca.logmasker.masking.testmodel.TopContainer;
+import com.leonelmfonseca.logmasker.masking.testmodel.TreeNode;
+
+@SpringBootTest
+class MaskingServiceTest {
+
+    @Autowired
+    private MaskingService maskingService;
+
+    @Test
+    void hasMaskedFieldsForDirectlyAnnotatedClass() {
+        assertThat(maskingService.hasMaskedFields(Garage.class)).isTrue();
+    }
+
+    @Test
+    void hasMaskedFieldsForNestedAnnotatedRecord() {
+        assertThat(maskingService.hasMaskedFields(Car.class)).isTrue();
+    }
+
+    @Test
+    void hasMaskedFieldsForPlainObjectIsFalse() {
+        assertThat(maskingService.hasMaskedFields(String.class)).isFalse();
+    }
+
+    @Test
+    void maskStringFieldWithPrefixAndSuffix() {
+        Garage g = new Garage("123 Main St", 50, List.of());
+        String result = String.valueOf(maskingService.mask(g));
+        assertThat(result).contains("address=1*********t");
+    }
+
+    @Test
+    void maskIntFieldWithDefaultReplacement() {
+        Garage g = new Garage("X", 50, List.of());
+        String result = String.valueOf(maskingService.mask(g));
+        assertThat(result).contains("capacity=****");
+    }
+
+    @Test
+    void maskListFieldWithCustomReplacement() {
+        Garage g = new Garage("X", 0, List.of(new Car("Red", BigDecimal.valueOf(100))));
+        String result = String.valueOf(maskingService.mask(g));
+        assertThat(result).contains("cars=***CARS***");
+    }
+
+    @Test
+    void nestedRecordPriceIsMaskedViaDeepTraversal() {
+        List<Car> cars = List.of(
+            new Car("Red", BigDecimal.valueOf(100)),
+            new Car("Blue", BigDecimal.valueOf(200))
+        );
+        Dealership d = new Dealership("Acme", cars);
+        String result = String.valueOf(maskingService.mask(d));
+
+        assertThat(result)
+            .contains("name=****")
+            .contains("price=****")
+            .doesNotContain("price=100")
+            .doesNotContain("price=200")
+            .contains("color=Red")
+            .contains("color=Blue");
+    }
+
+    @Test
+    void garageWithCustomCarReplacementHidesNestedDetails() {
+        Garage g = new Garage("X", 0, List.of(new Car("Red", BigDecimal.valueOf(100))));
+        String result = String.valueOf(maskingService.mask(g));
+
+        assertThat(result)
+            .contains("cars=***CARS***")
+            .doesNotContain("price=100");
+    }
+
+    @Test
+    void unmaskedFieldsAreVisible() {
+        Car car = new Car("Red", BigDecimal.valueOf(100));
+        String result = String.valueOf(maskingService.mask(car));
+
+        assertThat(result)
+            .contains("color=Red")
+            .contains("price=****");
+    }
+
+    @Test
+    void nullInputReturnsNull() {
+        assertThat(maskingService.mask(null)).isNull();
+    }
+
+    @Test
+    void collectionOfMaskedObjects() {
+        List<Car> cars = List.of(
+            new Car("Green", BigDecimal.valueOf(50)),
+            new Car("Yellow", BigDecimal.valueOf(75))
+        );
+        Object result = maskingService.mask(cars);
+        assertThat(result.toString())
+            .contains("price=****")
+            .doesNotContain("price=50")
+            .doesNotContain("price=75");
+    }
+
+    @Test
+    void mapWithMaskedValues() {
+        Map<String, Car> map = Map.of(
+            "primary", new Car("White", BigDecimal.valueOf(999))
+        );
+        Object result = maskingService.mask(map);
+        assertThat(result.toString())
+            .contains("price=****")
+            .doesNotContain("price=999");
+    }
+
+    @Test
+    void deepNestingMasksInnermostSecret() {
+        DeepSecret deep = new DeepSecret("my-secret");
+        MiddleLayer mid = new MiddleLayer(deep, "visible-text");
+        TopContainer top = new TopContainer(mid, "top-name");
+        String result = String.valueOf(maskingService.mask(top));
+
+        assertThat(result)
+            .contains("secret=****")
+            .contains("visible=visible-text")
+            .contains("name=top-name")
+            .doesNotContain("my-secret");
+    }
+
+    @Test
+    void cycleDetectionDoesNotStackOverflow() {
+        TreeNode child = new TreeNode("child", List.of());
+        TreeNode parent = new TreeNode("parent", List.of(child));
+        String result = String.valueOf(maskingService.mask(parent));
+
+        assertThat(result)
+            .contains("label=****")
+            .doesNotContain("label=child")
+            .doesNotContain("label=parent");
+    }
+
+    @Test
+    void maskedSetFieldIsReplaced() {
+        DataStructures ds = new DataStructures(
+            Set.of("a", "b"), null, null, null, null, null, null, null);
+        String result = String.valueOf(maskingService.mask(ds));
+        assertThat(result).contains("maskedSet=***SET***");
+    }
+
+    @Test
+    void maskedMapFieldIsReplaced() {
+        DataStructures ds = new DataStructures(
+            null, Map.of("k1", 1, "k2", 2), null, null, null, null, null, null);
+        String result = String.valueOf(maskingService.mask(ds));
+        assertThat(result).contains("maskedMap=***MAP***");
+    }
+
+    @Test
+    void maskedPrimitiveArrayIsReplaced() {
+        DataStructures ds = new DataStructures(
+            null, null, new int[]{10, 20, 30}, null, null, null, null, null);
+        String result = String.valueOf(maskingService.mask(ds));
+        assertThat(result).contains("maskedIntArray=***INT_ARR***");
+    }
+
+    @Test
+    void maskedObjectArrayIsReplaced() {
+        Car[] cars = new Car[]{new Car("Red", BigDecimal.valueOf(100))};
+        DataStructures ds = new DataStructures(
+            null, null, null, cars, null, null, null, null);
+        String result = String.valueOf(maskingService.mask(ds));
+        assertThat(result).contains("maskedCarArray=***CAR_ARR***");
+    }
+
+    @Test
+    void maskedQueueIsReplaced() {
+        Queue<String> q = new LinkedList<>();
+        q.add("x");
+        DataStructures ds = new DataStructures(
+            null, null, null, null, q, null, null, null);
+        String result = String.valueOf(maskingService.mask(ds));
+        assertThat(result).contains("maskedQueue=***QUEUE***");
+    }
+
+    @Test
+    void maskedDequeIsReplaced() {
+        Deque<String> dq = new ArrayDeque<>();
+        dq.add("y");
+        DataStructures ds = new DataStructures(
+            null, null, null, null, null, dq, null, null);
+        String result = String.valueOf(maskingService.mask(ds));
+        assertThat(result).contains("maskedDeque=***DEQUE***");
+    }
+
+    @Test
+    void unannotatedListOfMaskedRecordsMasksElementsTransitively() {
+        List<DeepSecret> secrets = List.of(
+            new DeepSecret("alpha"), new DeepSecret("omega"));
+        DataStructures ds = new DataStructures(
+            null, null, null, null, null, null, null, secrets);
+        String result = String.valueOf(maskingService.mask(ds));
+
+        assertThat(result)
+            .contains("secret=****")
+            .doesNotContain("alpha")
+            .doesNotContain("omega");
+    }
+
+    @Test
+    void emptyCollectionFieldWithMaskIsStillReplaced() {
+        DataStructures ds = new DataStructures(
+            Set.of(), null, null, null, null, null, null, null);
+        String result = String.valueOf(maskingService.mask(ds));
+        assertThat(result).contains("maskedSet=***SET***");
+    }
+
+    @Test
+    void treeNodeWithCycleInListDoesNotLoop() {
+        TreeNode root = new TreeNode("root", new LinkedList<>());
+        root.getChildren().add(root);
+        String result = String.valueOf(maskingService.mask(root));
+
+        assertThat(result)
+            .contains("label=****")
+            .contains("(");
+    }
+
+    @Test
+    void hasMaskedFieldsForTransitiveClass() {
+        assertThat(maskingService.hasMaskedFields(TopContainer.class)).isTrue();
+        assertThat(maskingService.hasMaskedFields(MiddleLayer.class)).isTrue();
+        assertThat(maskingService.hasMaskedFields(DataStructures.class)).isTrue();
+    }
+}
+
+
+package com.leonelmfonseca.logmasker.masking.testmodel;
+
+import java.math.BigDecimal;
+
+import com.leonelmfonseca.logmasker.annotation.Mask;
+
+public record Car(String color, @Mask BigDecimal price) {}
+
+package com.leonelmfonseca.logmasker.masking.testmodel;
+
+import java.util.Deque;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+
+import com.leonelmfonseca.logmasker.annotation.Mask;
+
+public class DataStructures {
+
+    @Mask(value = "***SET***")
+    private Set<String> maskedSet;
+
+    @Mask(value = "***MAP***")
+    private Map<String, Integer> maskedMap;
+
+    @Mask(value = "***INT_ARR***")
+    private int[] maskedIntArray;
+
+    @Mask(value = "***CAR_ARR***")
+    private Car[] maskedCarArray;
+
+    @Mask(value = "***QUEUE***")
+    private Queue<String> maskedQueue;
+
+    @Mask(value = "***DEQUE***")
+    private Deque<String> maskedDeque;
+
+    private TreeNode cycleRoot;
+
+    private List<DeepSecret> secrets;
+
+    public DataStructures(
+            Set<String> maskedSet,
+            Map<String, Integer> maskedMap,
+            int[] maskedIntArray,
+            Car[] maskedCarArray,
+            Queue<String> maskedQueue,
+            Deque<String> maskedDeque,
+            TreeNode cycleRoot,
+            List<DeepSecret> secrets) {
+        this.maskedSet = maskedSet;
+        this.maskedMap = maskedMap;
+        this.maskedIntArray = maskedIntArray;
+        this.maskedCarArray = maskedCarArray;
+        this.maskedQueue = maskedQueue;
+        this.maskedDeque = maskedDeque;
+        this.cycleRoot = cycleRoot;
+        this.secrets = secrets;
+    }
+
+    public Set<String> getMaskedSet() { return maskedSet; }
+    public Map<String, Integer> getMaskedMap() { return maskedMap; }
+    public int[] getMaskedIntArray() { return maskedIntArray; }
+    public Car[] getMaskedCarArray() { return maskedCarArray; }
+    public Queue<String> getMaskedQueue() { return maskedQueue; }
+    public Deque<String> getMaskedDeque() { return maskedDeque; }
+    public TreeNode getCycleRoot() { return cycleRoot; }
+    public List<DeepSecret> getSecrets() { return secrets; }
+}
+package com.leonelmfonseca.logmasker.masking.testmodel;
+
+import java.util.List;
+
+import com.leonelmfonseca.logmasker.annotation.Mask;
+
+public class Dealership {
+
+    @Mask
+    private String name;
+
+    private List<Car> cars;
+
+    public Dealership(String name, List<Car> cars) {
+        this.name = name;
+        this.cars = cars;
+    }
+
+    public String getName() { return name; }
+    public List<Car> getCars() { return cars; }
+}
+package com.leonelmfonseca.logmasker.masking.testmodel;
+
+import com.leonelmfonseca.logmasker.annotation.Mask;
+
+public record DeepSecret(@Mask String secret) {}
+
+package com.leonelmfonseca.logmasker.masking.testmodel;
+
+import java.util.List;
+
+import com.leonelmfonseca.logmasker.annotation.Mask;
+
+public class Garage {
+
+    @Mask(prefix = 1, suffix = 1)
+    private String address;
+
+    @Mask
+    private int capacity;
+
+    @Mask(value = "***CARS***")
+    private List<Car> cars;
+
+    public Garage(String address, int capacity, List<Car> cars) {
+        this.address = address;
+        this.capacity = capacity;
+        this.cars = cars;
+    }
+
+    public String getAddress() { return address; }
+    public int getCapacity() { return capacity; }
+    public List<Car> getCars() { return cars; }
+}
+
+
+package com.leonelmfonseca.logmasker.masking.testmodel;
+
+public class MiddleLayer {
+
+    private DeepSecret deep;
+    private String visible;
+
+    public MiddleLayer(DeepSecret deep, String visible) {
+        this.deep = deep;
+        this.visible = visible;
+    }
+
+    public DeepSecret getDeep() { return deep; }
+    public String getVisible() { return visible; }
+}
+
+package com.leonelmfonseca.logmasker.masking.testmodel;
+
+public class TopContainer {
+
+    private MiddleLayer middle;
+    private String name;
+
+    public TopContainer(MiddleLayer middle, String name) {
+        this.middle = middle;
+        this.name = name;
+    }
+
+    public MiddleLayer getMiddle() { return middle; }
+    public String getName() { return name; }
+}
+package com.leonelmfonseca.logmasker.masking.testmodel;
+
+import java.util.List;
+
+import com.leonelmfonseca.logmasker.annotation.Mask;
+
+public class TreeNode {
+
+    @Mask
+    private String label;
+
+    private List<TreeNode> children;
+
+    public TreeNode(String label, List<TreeNode> children) {
+        this.label = label;
+        this.children = children;
+    }
+
+    public String getLabel() { return label; }
+    public List<TreeNode> getChildren() { return children; }
 }
