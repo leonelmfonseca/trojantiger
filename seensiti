@@ -522,3 +522,23 @@ public final class SensitiveLoggingBootstrap {
         context.addTurboFilter(filter);
     }
 }
+
+// Maps: handle mutable and immutable maps safely
+if (obj instanceof Map<?, ?> map) {
+    // Try to mutate in place when possible
+    try {
+        @SuppressWarnings("unchecked")
+        Map<Object, Object> m = (Map<Object, Object>) map;
+        for (Object key : new ArrayList<>(m.keySet())) {
+            m.put(key, maskObject(m.get(key), visited));
+        }
+        return obj;
+    } catch (UnsupportedOperationException | ClassCastException ex) {
+        // Fallback: create a new map with masked values and return it
+        Map<Object, Object> copy = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> e : map.entrySet()) {
+            copy.put(e.getKey(), maskObject(e.getValue(), visited));
+        }
+        return copy;
+    }
+}
