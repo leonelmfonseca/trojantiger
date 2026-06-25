@@ -260,15 +260,33 @@ public class MaskingService {
         }
     }
 
+    private static String classToJvmSignature(String className) {
+        String[] parts = className.split("\\.");
+        StringBuilder sb = new StringBuilder();
+        boolean inClass = false;
+        for (String part : parts) {
+            if (!inClass && !part.isEmpty() && Character.isUpperCase(part.charAt(0))) {
+                inClass = true;
+            }
+            if (!sb.isEmpty()) sb.append(inClass ? '$' : '/');
+            sb.append(part);
+        }
+        return sb.toString();
+    }
+
     private static boolean referencesClass(FieldInfo fi, String className) {
         String sig = fi.getTypeSignatureStr();
         if (sig != null) {
             if (sig.contains(className)) return true;
-            if (sig.contains(className.replace('.', '/'))) return true;
+            if (sig.contains(classToJvmSignature(className))) return true;
         }
 
         String desc = fi.getTypeDescriptor().toString();
-        return desc != null && desc.contains(className);
+        if (desc != null) {
+            if (desc.contains(className)) return true;
+            if (desc.replace('$', '.').contains(className)) return true;
+        }
+        return false;
     }
 
     public boolean hasMaskedFields(Class<?> clazz) {
@@ -414,6 +432,7 @@ public class MaskingService {
         return "*".repeat(value.length());
     }
 }
+
 
 
 ---
