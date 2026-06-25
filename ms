@@ -1,0 +1,281 @@
+package com.leonelmfonseca.logmasker.masking;
+
+import java.lang.reflect.Array;
+import java.lang.reflect.Field;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+import com.leonelmfonseca.logmasker.annotation.Mask;
+
+import io.github.classgraph.ClassGraph;
+import io.github.classgraph.ClassInfo;
+import io.github.classgraph.FieldInfo;
+import io.github.classgraph.ScanResult;
+
+public class MaskingService {
+
+    private static final Set<Class<?>> SIMPLE_TYPES = Set.of(
+            String.class, Boolean.class, Character.class, Byte.class,
+            Short.class, Integer.class, Long.class, Float.class, Double.class,
+            java.math.BigDecimal.class, java.math.BigInteger.class);
+
+    private final Map<String, List<MaskedField>> cache = new ConcurrentHashMap<>();
+
+    private record MaskedField(String name, String replacement, int prefix, int suffix) {}
+
+    private final MaskingProperties maskingProperties;
+
+    public MaskingService(MaskingProperties maskingProperties) {
+        this.maskingProperties = maskingProperties;
+    }
+
+    public void init() {
+        List<String> scanPackages = maskingProperties.getScanPackages();
+        if (scanPackages.isEmpty()) {
+            System.out.println("WARN: logmasker.scan-packages is empty — no classes will be scanned for @Mask annotations");
+            return;
+        }
+
+        ClassGraph classGraph = new ClassGraph()
+                .enableAllInfo()
+                .ignoreClassVisibility()
+                .ignoreFieldVisibility();
+        for (String pkg : scanPackages) {
+            classGraph.acceptPackages(pkg);
+        }
+
+        try (ScanResult scanResult = classGraph.scan()) {
+
+            Set<String> direct = new HashSet<>();
+            Map<String, List<MaskedField>> fieldMap = new HashMap<>();
+
+            for (ClassInfo ci : scanResult.getAllClasses()) {
+                List<MaskedField> fields = new ArrayList<>();
+                for (FieldInfo fi : ci.getFieldInfo()) {
+                    if (fi.hasAnnotation("com.leonelmfonseca.logmasker.annotation.Mask")) {
+                        try {
+                            Class<?> clazz = ci.loadClass();
+                            Field f = clazz.getDeclaredField(fi.getName());
+                            Mask ann = f.getAnnotation(Mask.class);
+                            if (ann != null) {
+                                fields.add(new MaskedField(fi.getName(), ann.value(), ann.prefix(), ann.suffix()));
+                            }
+                        } catch (Exception ignored) {
+                        }
+                    }
+                }
+                if (!fields.isEmpty()) {
+                    direct.add(ci.getName());
+                    fieldMap.put(ci.getName(), List.copyOf(fields));
+                }
+            }
+
+            Set<String> transitive = new HashSet<>(direct);
+            List<ClassInfo> remaining = new ArrayList<>();
+            for (ClassInfo ci : scanResult.getAllClasses()) {
+                if (!transitive.contains(ci.getName())) {
+                    remaining.add(ci);
+                }
+            }
+
+            Deque<String> frontier = new ArrayDeque<>(direct);
+            while (!frontier.isEmpty()) {
+                String current = frontier.poll();
+                List<ClassInfo> next = new ArrayList<>();
+                for (ClassInfo ci : remaining) {
+                    for (FieldInfo fi : ci.getFieldInfo()) {
+                        if (referencesClass(fi, current)) {
+                            String cn = ci.getName();
+                            if (transitive.add(cn)) {
+                                frontier.add(cn);
+                                next.add(ci);
+                                fieldMap.putIfAbsent(cn, List.of());
+                            }
+                            break;
+                        }
+                    }
+                }
+                remaining.removeAll(next);
+            }
+
+            for (Map.Entry<String, List<MaskedField>> e : fieldMap.entrySet()) {
+                cache.put(e.getKey(), e.getValue());
+            }
+
+            System.out.println("MaskingService initialized: " + direct.size() + " direct + " +
+                    (transitive.size() - direct.size()) + " transitively masked classes");
+        }
+    }
+
+    private static String classToJvmSignature(String className) {
+        String[] parts = className.split("\\.");
+        StringBuilder sb = new StringBuilder();
+        boolean inClass = false;
+        for (String part : parts) {
+            if (!inClass && !part.isEmpty() && Character.isUpperCase(part.charAt(0))) {
+                inClass = true;
+            }
+            if (!sb.isEmpty()) sb.append(inClass ? '$' : '/');
+            sb.append(part);
+        }
+        return sb.toString();
+    }
+
+    private static boolean referencesClass(FieldInfo fi, String className) {
+        String sig = fi.getTypeSignatureStr();
+        if (sig != null) {
+            if (sig.contains(className)) return true;
+            if (sig.contains(classToJvmSignature(className))) return true;
+        }
+
+        String desc = fi.getTypeDescriptor().toString();
+        if (desc != null) {
+            if (desc.contains(className)) return true;
+            if (desc.contains(classToJvmSignature(className))) return true;
+        }
+        return false;
+    }
+
+    public boolean hasMaskedFields(Class<?> clazz) {
+        return cache.containsKey(clazz.getName());
+    }
+
+    public Object mask(Object obj) {
+        if (obj == null) return null;
+        return toMaskedString(obj, Collections.newSetFromMap(new IdentityHashMap<>()));
+    }
+
+    private Object toMaskedString(Object obj, Set<Object> visited) {
+        if (obj == null) return "null";
+
+        Class<?> clazz = obj.getClass();
+
+        if (clazz.isPrimitive() || SIMPLE_TYPES.contains(clazz)) {
+            return obj;
+        }
+
+        if (!visited.add(obj)) {
+            return "(" + clazz.getSimpleName() + " ...)";
+        }
+
+        try {
+            if (clazz.isArray()) {
+                return maskArray(obj, visited);
+            }
+            if (obj instanceof Collection<?> coll) {
+                return maskCollection(coll, visited);
+            }
+            if (obj instanceof Map<?, ?> map) {
+                return maskMap(map, visited);
+            }
+            return maskObject(obj, clazz, visited);
+        } finally {
+            visited.remove(obj);
+        }
+    }
+
+    private String maskArray(Object array, Set<Object> visited) {
+        int len = Array.getLength(array);
+        List<Object> masked = new ArrayList<>(len);
+        for (int i = 0; i < len; i++) {
+            masked.add(toMaskedString(Array.get(array, i), visited));
+        }
+        return masked.toString();
+    }
+
+    private String maskCollection(Collection<?> coll, Set<Object> visited) {
+        List<Object> masked = new ArrayList<>(coll.size());
+        for (Object elem : coll) {
+            masked.add(toMaskedString(elem, visited));
+        }
+        return masked.toString();
+    }
+
+    private String maskMap(Map<?, ?> map, Set<Object> visited) {
+        Map<Object, Object> masked = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            masked.put(toMaskedString(entry.getKey(), visited), toMaskedString(entry.getValue(), visited));
+        }
+        return masked.toString();
+    }
+
+    private String maskObject(Object obj, Class<?> clazz, Set<Object> visited) {
+        List<MaskedField> maskedFields = cache.get(clazz.getName());
+        List<String> parts = new ArrayList<>();
+
+        if (clazz.isRecord()) {
+            for (var comp : clazz.getRecordComponents()) {
+                try {
+                    Object value = comp.getAccessor().invoke(obj);
+                    parts.add(comp.getName() + "=" + maskFieldValue(comp.getName(), value, maskedFields, visited));
+                } catch (Exception e) {
+                    parts.add(comp.getName() + "=<error>");
+                }
+            }
+        } else {
+            for (Class<?> cls = clazz; cls != null && cls != Object.class; cls = cls.getSuperclass()) {
+                for (Field field : cls.getDeclaredFields()) {
+                    field.setAccessible(true);
+                    try {
+                        Object value = field.get(obj);
+                        parts.add(field.getName() + "=" + maskFieldValue(field.getName(), value, maskedFields, visited));
+                    } catch (IllegalAccessException e) {
+                        parts.add(field.getName() + "=<unavailable>");
+                    }
+                }
+            }
+        }
+
+        return clazz.getSimpleName() + "[" + String.join(", ", parts) + "]";
+    }
+
+    private Object maskFieldValue(String fieldName, Object value, List<MaskedField> maskedFields, Set<Object> visited) {
+        MaskedField mf = findMaskedField(fieldName, maskedFields);
+        Object masked = toMaskedString(value, visited);
+
+        if (mf != null) {
+            String str = masked != null ? masked.toString() : "null";
+            return applyMask(str, mf);
+        }
+
+        return masked;
+    }
+
+    private static MaskedField findMaskedField(String fieldName, List<MaskedField> maskedFields) {
+        if (maskedFields == null) return null;
+        for (MaskedField mf : maskedFields) {
+            if (mf.name().equals(fieldName)) return mf;
+        }
+        return null;
+    }
+
+    private static String applyMask(String value, MaskedField mf) {
+        if (value == null) return "null";
+
+        int prefix = mf.prefix();
+        int suffix = mf.suffix();
+
+        if (prefix > 0 || suffix > 0) {
+            int visibleLen = prefix + suffix;
+            if (visibleLen >= value.length()) {
+                return value;
+            }
+            StringBuilder sb = new StringBuilder(value.length());
+            if (prefix > 0) {
+                sb.append(value, 0, prefix);
+            }
+            sb.append("*".repeat(value.length() - visibleLen));
+            if (suffix > 0) {
+                sb.append(value.substring(value.length() - suffix));
+            }
+            return sb.toString();
+        }
+
+        String replacement = mf.replacement();
+        if (!replacement.isEmpty()) {
+            return replacement;
+        }
+
+        return "*".repeat(value.length());
+    }
+}
