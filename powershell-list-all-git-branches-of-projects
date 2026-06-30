@@ -1,0 +1,20 @@
+# Git Repository Branches Listing
+
+$directory = "C:\Path\To\Your\Directory"
+
+Get-ChildItem -Path $directory -Recurse -Directory | ForEach-Object {
+    $gitPath = Join-Path -Path $_.FullName -ChildPath ".git"
+    if (Test-Path $gitPath) {
+        Write-Host "Repository: $($_.FullName)"
+        
+        # Local branches
+        Write-Host "Local Branches:"
+        git -C $_.FullName branch
+        
+        # Remote branches
+        Write-Host "Remote Branches:"
+        git -C $_.FullName branch -r
+        
+        Write-Host "`n"
+    }
+}
