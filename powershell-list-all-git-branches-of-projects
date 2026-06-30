@@ -1,20 +1,44 @@
-# Git Repository Branches Listing
+# Git Repository Branches Search
 
-$directory = "C:\Path\To\Your\Directory"
+param (
+    [string]$directory = (Get-Location),
+    [string]$partialString
+)
 
-Get-ChildItem -Path $directory -Recurse -Directory | ForEach-Object {
-    $gitPath = Join-Path -Path $_.FullName -ChildPath ".git"
-    if (Test-Path $gitPath) {
-        Write-Host "Repository: $($_.FullName)"
+function Get-GitBranches {
+    param (
+        [string]$repoPath
+    )
+    
+    Set-Location $repoPath
+    $localBranches = git branch --list
+    $remoteBranches = git branch -r --list
+
+    return @{
+        LocalBranches = $localBranches
+        RemoteBranches = $remoteBranches
+    }
+}
+
+$gitRepos = Get-ChildItem -Path $directory -Recurse -Directory | Where-Object {
+    Test-Path "$($_.FullName)\.git"
+}
+
+foreach ($repo in $gitRepos) {
+    $branches = Get-GitBranches -repoPath $repo.FullName
+    Write-Host "Repository: $($repo.FullName)"
+    Write-Host "Local Branches:"
+    $branches.LocalBranches | ForEach-Object { Write-Host $_ }
+    Write-Host "Remote Branches:"
+    $branches.RemoteBranches | ForEach-Object { Write-Host $_ }
+    
+    if ($partialString) {
+        $matchingLocalBranches = $branches.LocalBranches | Where-Object { $_ -like "*$partialString*" }
+        $matchingRemoteBranches = $branches.RemoteBranches | Where-Object { $_ -like "*$partialString*" }
         
-        # Local branches
-        Write-Host "Local Branches:"
-        git -C $_.FullName branch
-        
-        # Remote branches
-        Write-Host "Remote Branches:"
-        git -C $_.FullName branch -r
-        
-        Write-Host "`n"
+        Write-Host "Matching Local Branches:"
+        $matchingLocalBranches | ForEach-Object { Write-Host $_ }
+        Write-Host "Matching Remote Branches:"
+        $matchingRemoteBranches | ForEach-Object { Write-Host $_ }
     }
 }
