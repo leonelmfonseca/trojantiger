@@ -1,0 +1,23 @@
+Use `git log` with graph formatting:
+
+```bash
+git log --all --graph --decorate --oneline --abbrev-commit
+```
+
+If you want branches only:
+
+```bash
+git log --graph --decorate --oneline --abbrev-commit branch1 branch2
+```
+
+For a prettier full repo graph:
+
+```bash
+git log --all --graph --decorate --oneline --abbrev-commit --color
+```
+
+And if you want a reusable alias:
+
+```bash
+git config --global alias.lg "log --all --graph --decorate --oneline --abbrev-commit"
+```
