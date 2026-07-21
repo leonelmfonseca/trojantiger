@@ -1,0 +1,56 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: resilience-cache-poc
+
+# --- Two separate in-memory H2 instances, standing in for: ---
+# primary   -> "DB2"        (the system of record; can be flipped to simulate an outage)
+# cache     -> "PostgreSQL" (the durable failover cache)
+# Both instances and their connection details are wired explicitly in
+# DataSourceConfig.java rather than via spring.datasource.* properties,
+# since Spring Boot only auto-configures a single default DataSource.
+app:
+  cache:
+    ttl-hours: 4          # how long a cached row is considered valid
+    max-rows: 500000      # hard cap; oldest rows trimmed beyond this
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      dbPrimary:
+        registerHealthIndicator: true
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 10
+        minimumNumberOfCalls: 5
+        failureRateThreshold: 50
+        waitDurationInOpenState: 15s
+        permittedNumberOfCallsInHalfOpenState: 3
+        automaticTransitionFromOpenToClosedEnabled: true
+        recordExceptions:
+          - java.sql.SQLException
+          - org.springframework.dao.DataAccessException
+          - com.demo.cachepoc.service.SimulatedOutageException
+  timelimiter:
+    instances:
+      dbPrimary:
+        timeoutDuration: 2s
+        cancelRunningFuture: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,circuitbreakers,circuitbreakerevents
+  endpoint:
+    health:
+      show-details: always
+  health:
+    circuitbreakers:
+      enabled: true
+
+logging:
+  level:
+    com.demo.cachepoc: INFO
+    io.github.resilience4j: INFO
