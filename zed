@@ -31,3 +31,39 @@ private boolean hasEmptyRule(BlackWhiteList rule) {
         && !hasValue(id.getCodeDetailed())
         && !hasValue(id.getWay());
 }
+
+
+private String buildLogMessage(BlackWhiteList winner, ListCheckResult result, String accId) {
+    if (result == ListCheckResult.EMPTY_RULE) {
+        return "Account [%s] matched a rule with no criteria → EMPTY_RULE".formatted(accId);
+    }
+
+    var id = winner.getId();
+
+    var filledFields = Stream.of(
+            id.getCode() != null ? "code=" + id.getCode() : null,
+            hasValue(id.getCodeDetailed()) ? "codeDetailed=" + id.getCodeDetailed() : null,
+            hasValue(id.getWay()) ? "way=" + id.getWay() : null
+        )
+        .filter(Objects::nonNull)
+        .toList(); // Java 16+ — no need for Collectors.toList()
+
+    var qualifier = switch (filledFields.size()) {
+        case 1 -> "only ";
+        case 3 -> "all criteria: ";
+        default -> "";
+    };
+
+    var verdict = switch (result) {
+        case WHITELISTED -> "WHITELISTED — request is allowed";
+        case BLACKLISTED -> "BLACKLISTED — request is denied";
+        default -> result.name();
+    };
+
+    return "Account [%s] matches a rule requiring %s%s → %s".formatted(
+        accId,
+        qualifier,
+        String.join(" and ", filledFields),
+        verdict
+    );
+}
