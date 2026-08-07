@@ -1,18 +1,54 @@
-public static Specification<BlackWhiteList> matches(String code, String codeDetailed, String way) {
-    return ((Root<BlackWhiteList> root, CriteriaQuery<?> query, CriteriaBuilder cb) -> {
-        query.orderBy(
-            cb.asc(cb.selectCase()
-                .when(cb.isNull(root.get("id").get("code")), 0)
-                .otherwise(1)),
-            cb.asc(cb.selectCase()
-                .when(cb.isNull(root.get("id").get("way")), 0)
-                .otherwise(1)),
-            cb.asc(cb.selectCase()
-                .when(cb.isNull(root.get("id").get("codeDetailed")), 0)
-                .otherwise(1))
-        );
-        return null;
-    }).and(fieldMatches("code", code))
-      .and(fieldMatches("codeDetailed", codeDetailed))
-      .and(fieldMatches("way", way));
+import com.azqore.payments.paydataservice.entity.BlackWhiteList;
+import jakarta.persistence.criteria.CriteriaBuilder;
+import jakarta.persistence.criteria.CriteriaQuery;
+import jakarta.persistence.criteria.Expression;
+import jakarta.persistence.criteria.Path;
+import jakarta.persistence.criteria.Root;
+import org.springframework.data.jpa.domain.Specification;
+
+public class AccessControlListSpecs {
+
+    public static Specification<BlackWhiteList> matches(String code, String codeDetailed, String way) {
+        return ((Root<BlackWhiteList> root, CriteriaQuery<?> query, CriteriaBuilder cb) -> {
+            query.orderBy(
+                cb.asc(cb.selectCase()
+                    .when(cb.isNull(root.get("id").get("code")), 0)
+                    .otherwise(1)),
+                cb.asc(cb.selectCase()
+                    .when(cb.isNull(root.get("id").get("way")), 0)
+                    .otherwise(1)),
+                cb.asc(cb.selectCase()
+                    .when(cb.isNull(root.get("id").get("codeDetailed")), 0)
+                    .otherwise(1))
+            );
+            return null;
+        }).and(fieldMatches("code", code))
+          .and(fieldMatches("codeDetailed", codeDetailed))
+          .and(fieldMatches("way", way));
+    }
+
+    private static Specification<BlackWhiteList> fieldMatches(String field, String requestValue) {
+        return (Root<BlackWhiteList> root, CriteriaQuery<?> query, CriteriaBuilder cb) -> {
+            Path<?> path = root.get("id").get(field);
+
+            if (path.getJavaType() == Integer.class) {
+                try {
+                    return cb.or(
+                        cb.isNull(path),
+                        cb.equal(path.as(Integer.class), Integer.parseInt(requestValue))
+                    );
+                } catch (NumberFormatException e) {
+                    return cb.disjunction(); // always false — invalid value
+                }
+            }
+
+            // String field — wildcard logic with trim
+            Expression<String> stringPath = path.as(String.class);
+            return cb.or(
+                cb.isNull(path),
+                cb.equal(cb.trim(stringPath), ""),
+                cb.equal(stringPath, requestValue)
+            );
+        };
+    }
 }
