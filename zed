@@ -1,23 +1,33 @@
-public static Specification<BlackWhiteList> matches(String code, String codeDetailed, String way) {
-    
-    Specification<BlackWhiteList> ordering = 
-        (Root<BlackWhiteList> root, CriteriaQuery<?> query, CriteriaBuilder cb) -> {
-            query.orderBy(
-                cb.asc(cb.selectCase()
-                    .when(cb.isNull(root.get("id").get("code")), 0)
-                    .otherwise(1)),
-                cb.asc(cb.selectCase()
-                    .when(cb.isNull(root.get("id").get("way")), 0)
-                    .otherwise(1)),
-                cb.asc(cb.selectCase()
-                    .when(cb.isNull(root.get("id").get("codeDetailed")), 0)
-                    .otherwise(1))
-            );
-            return cb.conjunction(); // always true — just here for ordering
-        };
+public ListCheckResult evaluate(AccountLookupRequest request) {
+    var matches = repo.findAll(
+        AccessControlListSpecs.matches(
+            request.getCode(),
+            request.getCodeDetailed(),
+            request.getWay()
+        )
+    );
 
-    return ordering
-        .and(fieldMatches("code", code))
-        .and(fieldMatches("codeDetailed", codeDetailed))
-        .and(fieldMatches("way", way));
+    if (matches.isEmpty()) {
+        return ListCheckResult.NOT_IN_LIST;
+    }
+
+    if (matches.stream().anyMatch(this::hasEmptyRule)) {
+        log.warn("Account [{}] matched a rule with no criteria → EMPTY_RULE", request.getAccId());
+        return ListCheckResult.EMPTY_RULE;
+    }
+
+    var result = matches.stream()
+        .anyMatch(r -> r.getStatus() == RuleStatus.OK)
+        ? ListCheckResult.WHITELISTED
+        : ListCheckResult.BLACKLISTED;
+
+    log.info(buildLogMessage(matches.get(0), result, request.getAccId()));
+    return result;
+}
+
+private boolean hasEmptyRule(BlackWhiteList rule) {
+    var id = rule.getId();
+    return !hasValue(id.getCode() != null ? id.getCode().toString() : null)
+        && !hasValue(id.getCodeDetailed())
+        && !hasValue(id.getWay());
 }
