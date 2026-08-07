@@ -1,7 +1,18 @@
-SELECT 
-  'DB: ' || current_database() || 
-  ' | Schema: ' || current_schema() || 
-  ' | Version: ' || substring(version() from 'PostgreSQL ([^:]+)') ||
-  ' | User: ' || current_user ||
-  ' | IP: ' || inet_server_addr() ||
-  ' | Port: ' || inet_server_port() AS db_info;
+public static Specification<BlackWhiteList> matches(String code, String codeDetailed, String way) {
+    return ((Root<BlackWhiteList> root, CriteriaQuery<?> query, CriteriaBuilder cb) -> {
+        query.orderBy(
+            cb.asc(cb.selectCase()
+                .when(cb.isNull(root.get("id").get("code")), 0)
+                .otherwise(1)),
+            cb.asc(cb.selectCase()
+                .when(cb.isNull(root.get("id").get("way")), 0)
+                .otherwise(1)),
+            cb.asc(cb.selectCase()
+                .when(cb.isNull(root.get("id").get("codeDetailed")), 0)
+                .otherwise(1))
+        );
+        return null;
+    }).and(fieldMatches("code", code))
+      .and(fieldMatches("codeDetailed", codeDetailed))
+      .and(fieldMatches("way", way));
+}
